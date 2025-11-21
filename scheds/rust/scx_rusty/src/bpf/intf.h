@@ -66,6 +66,19 @@ enum consts {
 	MAX_DOM_ACTIVE_TPTRS	= 1024,
 
 	STATIC_ALLOC_PAGES_GRANULARITY = 1,
+
+	/* Task type ring buffer size */
+	TASK_TYPE_RING_SIZE	= 1024,
+};
+
+enum task_type {
+	TASK_TYPE_LC = 0,
+	TASK_TYPE_BE = 1,
+};
+
+struct task_type_entry {
+	u32 pid;
+	u8 task_type;
 };
 
 /* Statistics */
@@ -87,6 +100,7 @@ enum stat_idx {
 	RUSTY_STAT_REPATRIATE,
 	RUSTY_STAT_KICK_GREEDY,
 	RUSTY_STAT_LOAD_BALANCE,
+	RUSTY_STAT_BE_DELAYED,
 
 	/* Errors */
 	RUSTY_STAT_TASK_GET_ERR,

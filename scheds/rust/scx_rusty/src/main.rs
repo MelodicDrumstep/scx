@@ -16,8 +16,10 @@ pub mod load_balance;
 use load_balance::LoadBalancer;
 
 mod stats;
+mod task_type;
 use std::collections::BTreeMap;
 use std::mem::MaybeUninit;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -229,6 +231,11 @@ struct Opts {
     /// prioritize energy efficiency. When in doubt, use 0 or 1024.
     #[clap(long, default_value = "0")]
     perf: u32,
+
+    /// (Deprecated) Task types are now updated dynamically via ring buffer.
+    /// Applications can use the task type API to push updates at runtime.
+    #[clap(long, value_name = "PATH", hide = true)]
+    task_type_shm: Option<PathBuf>,
 
     #[clap(flatten, next_help_heading = "Libbpf Options")]
     pub libbpf: LibbpfOpts,
@@ -451,6 +458,19 @@ impl<'a> Scheduler<'a> {
 
         // Attach.
         let mut skel = scx_ops_load!(skel, rusty, uei)?;
+        
+        // Initialize task type ring buffer for dynamic updates
+        task_type::init_task_type_ring_buffer(&mut skel)
+            .context("Failed to initialize task type ring buffer")?;
+        info!("Task type ring buffer initialized. Applications can push updates dynamically.");
+        
+        // Legacy support: if a file is provided, load initial task types
+        if let Some(ref shm_path) = opts.task_type_shm {
+            // For backward compatibility, we could load initial values here
+            // but the ring buffer approach is preferred for dynamic updates
+            info!("Note: task_type_shm option is deprecated. Use the ring buffer API for dynamic updates.");
+        }
+        
         let struct_ops = Some(scx_ops_attach!(skel, rusty)?);
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 

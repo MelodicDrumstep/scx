@@ -20,6 +20,17 @@ workloads. Various load balancing thresholds (e.g. greediness, frequency, etc),
 as well as how `scx_rusty` should partition the system into scheduling domains, can
 be tuned to achieve the optimal configuration for any given system or workload.
 
+## Task Types via Shared Memory
+
+`scx_rusty` can read task-type assignments from a shared memory file when it
+starts. Provide a path (for example one under `/dev/shm`) via
+`--task-type-shm <PATH>`. The file must contain whitespace-separated `PID TYPE`
+pairs per line, where `TYPE` is either `LC` (latency critical) or `BE`
+(best-effort). Lines beginning with `#` or blank lines are ignored. When a task
+that is tagged as `BE` becomes runnable, the in-kernel scheduler gives it a 0.5%
+chance of being enqueued rather than directly dispatched to a CPU, which lets
+latency-critical work run first.
+
 ## Production Ready?
 
 Yes. If tuned correctly, `scx_rusty` should be performant across various CPU

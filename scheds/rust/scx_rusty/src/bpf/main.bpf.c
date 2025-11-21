@@ -488,6 +488,31 @@ struct {
 	__uint(max_entries, RUSTY_NR_STATS);
 } stats SEC(".maps");
 
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__type(key, u32);
+	__type(value, u8);
+	__uint(max_entries, 100000);
+} task_type_by_pid SEC(".maps");
+
+/* Ring buffer for task type updates from userspace */
+struct task_type_ring {
+	struct bpf_spin_lock lock;
+	u32 producer;
+	u32 consumer;
+	struct task_type_entry entries[TASK_TYPE_RING_SIZE];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct task_type_ring);
+	__uint(max_entries, 1);
+	__uint(map_flags, 0);
+} task_type_ring_buffer SEC(".maps");
+
+#define BE_DELAY_PROB_DIVISOR 200U
+
 static inline void stat_add(enum stat_idx idx, u64 addend)
 {
 	u32 idx_v = idx;
@@ -495,6 +520,67 @@ static inline void stat_add(enum stat_idx idx, u64 addend)
 	u64 *cnt_p = bpf_map_lookup_elem(&stats, &idx_v);
 	if (cnt_p)
 		(*cnt_p) += addend;
+}
+
+static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
+{
+	u32 pid;
+	u8 *entry;
+
+	if (!taskc || !p)
+		return;
+
+	pid = READ_ONCE(p->pid);
+	entry = bpf_map_lookup_elem(&task_type_by_pid, &pid);
+	taskc->is_be_type = entry && *entry == TASK_TYPE_BE;
+}
+
+static bool should_delay_be_task(struct task_ctx *taskc)
+{
+	if (!taskc || !taskc->is_be_type)
+		return false;
+
+	return (bpf_get_prandom_u32() % BE_DELAY_PROB_DIVISOR) == 0;
+}
+
+/*
+ * Process task type updates from the ring buffer.
+ * Called periodically during scheduling to update task_type_by_pid map.
+ */
+static void process_task_type_ring_buffer(void)
+{
+	const u32 zero = 0;
+	struct task_type_ring *ring;
+	u32 processed = 0;
+	const u32 max_process = 32; /* Process up to 32 entries per call */
+
+	ring = bpf_map_lookup_elem(&task_type_ring_buffer, &zero);
+	if (!ring)
+		return;
+
+	bpf_spin_lock(&ring->lock);
+
+	while (processed < max_process && ring->consumer != ring->producer) {
+		struct task_type_entry *entry;
+		u32 idx = ring->consumer % TASK_TYPE_RING_SIZE;
+		u8 task_type_val;
+
+		entry = &ring->entries[idx];
+		task_type_val = entry->task_type;
+
+		/* Update the task_type_by_pid map */
+		if (task_type_val == TASK_TYPE_LC || task_type_val == TASK_TYPE_BE) {
+			bpf_map_update_elem(&task_type_by_pid, &entry->pid, &task_type_val, BPF_ANY);
+		} else {
+			/* Remove entry if invalid type */
+			bpf_map_delete_elem(&task_type_by_pid, &entry->pid);
+		}
+
+		ring->consumer++;
+		processed++;
+	}
+
+	bpf_spin_unlock(&ring->lock);
 }
 
 /*
@@ -919,8 +1005,17 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	refresh_tune_params();
 
+	/* Periodically process task type updates from ring buffer (1% chance) */
+	if ((bpf_get_prandom_u32() % 100) == 0)
+		process_task_type_ring_buffer();
+
 	if (!(taskc = lookup_task_ctx_mask(p, &p_cpumask)) || !p_cpumask)
 		goto enoent;
+
+	if (should_delay_be_task(taskc)) {
+		stat_add(RUSTY_STAT_BE_DELAYED, 1);
+		goto enoent;
+	}
 
 	if (p->nr_cpus_allowed == 1) {
 		cpu = prev_cpu;
@@ -1664,6 +1759,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rusty_init_task, struct task_struct *p,
 		.last_woke_at = now,
 		.preferred_dom_mask = 0,
 		.pid = p->pid,
+		.is_be_type = false,
 	};
 
 	if (debug >= 2)
@@ -1697,6 +1793,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rusty_init_task, struct task_struct *p,
 	}
 
 	bpf_rcu_read_lock();
+	assign_task_type(taskc, p);
 	task_pick_and_set_domain(taskc, p, p->cpus_ptr, true);
 	bpf_rcu_read_unlock();
 
