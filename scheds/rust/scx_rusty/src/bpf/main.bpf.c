@@ -544,43 +544,46 @@ static bool should_delay_be_task(struct task_ctx *taskc)
 }
 
 /*
- * Process task type updates from the ring buffer.
+ * Process one task type update from the ring buffer.
  * Called periodically during scheduling to update task_type_by_pid map.
+ * Processes only one entry per call to make lock/unlock clear to verifier.
  */
 static void process_task_type_ring_buffer(void)
 {
 	const u32 zero = 0;
 	struct task_type_ring *ring;
-	u32 processed = 0;
-	const u32 max_process = 32; /* Process up to 32 entries per call */
+	u32 idx;
+	struct task_type_entry *entry;
+	u32 pid;
+	u8 task_type_val;
 
 	ring = bpf_map_lookup_elem(&task_type_ring_buffer, &zero);
 	if (!ring)
 		return;
 
+	/* Lock, read one entry, update consumer, unlock */
 	bpf_spin_lock(&ring->lock);
 
-	while (processed < max_process && ring->consumer != ring->producer) {
-		struct task_type_entry *entry;
-		u32 idx = ring->consumer % TASK_TYPE_RING_SIZE;
-		u8 task_type_val;
-
-		entry = &ring->entries[idx];
-		task_type_val = entry->task_type;
-
-		/* Update the task_type_by_pid map */
-		if (task_type_val == TASK_TYPE_LC || task_type_val == TASK_TYPE_BE) {
-			bpf_map_update_elem(&task_type_by_pid, &entry->pid, &task_type_val, BPF_ANY);
-		} else {
-			/* Remove entry if invalid type */
-			bpf_map_delete_elem(&task_type_by_pid, &entry->pid);
-		}
-
-		ring->consumer++;
-		processed++;
+	if (ring->consumer == ring->producer) {
+		bpf_spin_unlock(&ring->lock);
+		return; /* Ring buffer is empty */
 	}
 
+	idx = ring->consumer % TASK_TYPE_RING_SIZE;
+	entry = &ring->entries[idx];
+	pid = entry->pid;
+	task_type_val = entry->task_type;
+	ring->consumer++;
+
 	bpf_spin_unlock(&ring->lock);
+
+	/* Now update the map outside the lock - verifier can clearly see unlock happened */
+	if (task_type_val == TASK_TYPE_LC || task_type_val == TASK_TYPE_BE) {
+		bpf_map_update_elem(&task_type_by_pid, &pid, &task_type_val, BPF_ANY);
+	} else {
+		/* Remove entry if invalid type */
+		bpf_map_delete_elem(&task_type_by_pid, &pid);
+	}
 }
 
 /*

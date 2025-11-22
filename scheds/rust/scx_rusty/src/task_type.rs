@@ -80,10 +80,11 @@ pub fn write_task_type_update(
     }
 
     // Calculate the index for the new entry
+    // Each entry is 8 bytes due to C struct padding: u32 pid (4) + u8 task_type (1) + 3 padding = 8
     let idx = producer % TASK_TYPE_RING_SIZE as u32;
-    let entry_offset = 12 + (idx as usize * 5); // Each entry is 5 bytes (4 bytes pid + 1 byte type)
+    let entry_offset = 12 + (idx as usize * 8);
 
-    if entry_offset + 5 > ring_bytes.len() {
+    if entry_offset + 8 > ring_bytes.len() {
         return Err(anyhow!("Ring buffer entry out of bounds"));
     }
 
@@ -92,10 +93,14 @@ pub fn write_task_type_update(
     // For now, we'll write the entry and update producer
     let mut new_ring_bytes = ring_bytes.to_vec();
 
-    // Write the entry (pid as u32, task_type as u8)
+    // Write the entry (pid as u32, task_type as u8, padding zeros)
     let pid_bytes = pid.to_ne_bytes();
     new_ring_bytes[entry_offset..entry_offset + 4].copy_from_slice(&pid_bytes);
     new_ring_bytes[entry_offset + 4] = task_type.as_raw();
+    // Clear padding bytes (offset +5, +6, +7)
+    new_ring_bytes[entry_offset + 5] = 0;
+    new_ring_bytes[entry_offset + 6] = 0;
+    new_ring_bytes[entry_offset + 7] = 0;
 
     // Update producer index
     let new_producer = producer + 1;
@@ -120,8 +125,9 @@ pub fn init_task_type_ring_buffer(skel: &mut BpfSkel) -> Result<()> {
     let key = RING_KEY.to_ne_bytes();
 
     // Initialize ring buffer: lock (4 bytes), producer (0), consumer (0), entries (all zeros)
-    // Total size: 4 (lock) + 4 (producer) + 4 (consumer) + (TASK_TYPE_RING_SIZE * 5) (entries)
-    let mut ring_data = vec![0u8; 12 + (TASK_TYPE_RING_SIZE * 5)];
+    // Each entry is 8 bytes due to C struct padding: u32 pid (4) + u8 task_type (1) + 3 padding = 8
+    // Total size: 4 (lock) + 4 (producer) + 4 (consumer) + (TASK_TYPE_RING_SIZE * 8) (entries)
+    let mut ring_data = vec![0u8; 12 + (TASK_TYPE_RING_SIZE * 8)];
 
     // Producer and consumer are already 0, lock is already 0
     // Just write the initialized structure
