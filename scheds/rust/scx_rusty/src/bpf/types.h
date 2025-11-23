@@ -59,8 +59,8 @@ struct task_ctx {
 	/* select_cpu() telling enqueue() to queue directly on the DSQ */
 	bool dispatch_local;
 
-	/* Whether the task should be treated as best-effort */
-	bool is_be_type;
+	/* Task type: -1 = uninitialized, 0 = LC, 1 = BE */
+	s8 task_type;
 
 	/* For visibility from userspace, may become stale after multithreaded exec */
 	u32 pid;

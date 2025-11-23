@@ -527,25 +527,36 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 	u32 pid;
 	u8 *entry;
 	u8 task_type_val;
+	s8 old_task_type;
 
 	if (!taskc || !p)
 		return;
 
 	pid = READ_ONCE(p->pid);
+	old_task_type = taskc->task_type;
 	entry = bpf_map_lookup_elem(&task_type_by_pid, &pid);
 	if (entry) {
 		task_type_val = *entry;
-		taskc->is_be_type = (task_type_val == TASK_TYPE_BE);
-		bpf_printk("[TASK_TYPE] Set task type for PID=%u (%s): TYPE=%s",
-			   pid, p->comm, task_type_val == TASK_TYPE_LC ? "LC" : "BE");
+		/* Convert TASK_TYPE_LC (0) to 0, TASK_TYPE_BE (1) to 1 */
+		taskc->task_type = (s8)task_type_val;
+		/* Only log when task type changes */
+		if (old_task_type != taskc->task_type) {
+			bpf_printk("[TASK_TYPE] Set task type for PID=%u (%s): TYPE=%s",
+				   pid, p->comm, task_type_val == TASK_TYPE_LC ? "LC" : "BE");
+		}
 	} else {
-		taskc->is_be_type = false;
+		/* Only log if task had a type and now has none */
+		if (old_task_type != -1) {
+			bpf_printk("[TASK_TYPE] Removed task type for PID=%u (%s)",
+				   pid, p->comm);
+		}
+		taskc->task_type = -1;
 	}
 }
 
 static bool should_delay_be_task(struct task_ctx *taskc)
 {
-	if (!taskc || !taskc->is_be_type)
+	if (!taskc || taskc->task_type != 1)
 		return false;
 
 	return (bpf_get_prandom_u32() % BE_DELAY_PROB_DIVISOR) == 0;
@@ -1027,7 +1038,7 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 	assign_task_type(taskc, p);
 
 	/* Check if this is a BE task during scheduling */
-	if (taskc->is_be_type) {
+	if (taskc->task_type == 1) {
 		bpf_printk("[TASK_TYPE] BE task detected during scheduling: PID=%u (%s)",
 			   READ_ONCE(p->pid), p->comm);
 	}
@@ -1782,7 +1793,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rusty_init_task, struct task_struct *p,
 		.last_woke_at = now,
 		.preferred_dom_mask = 0,
 		.pid = p->pid,
-		.is_be_type = false,
+		.task_type = -1,
 	};
 
 	if (debug >= 2)
