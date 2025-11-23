@@ -1018,13 +1018,13 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 	s32 cpu;
 
 	refresh_tune_params();
-
-	/* Periodically process task type updates from ring buffer (1% chance) */
-	if ((bpf_get_prandom_u32() % 100) == 0)
-		process_task_type_ring_buffer();
+	process_task_type_ring_buffer();
 
 	if (!(taskc = lookup_task_ctx_mask(p, &p_cpumask)) || !p_cpumask)
 		goto enoent;
+
+	/* Update task type before checking (in case it was just added) */
+	assign_task_type(taskc, p);
 
 	/* Check if this is a BE task during scheduling */
 	if (taskc->is_be_type) {
@@ -1270,6 +1270,9 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 
 	if (!(taskc = lookup_task_ctx_mask(p, &p_cpumask)) || !p_cpumask)
 		return;
+
+	/* Update task type on every enqueue to catch newly added mappings */
+	assign_task_type(taskc, p);
 
 	domc = task_domain(taskc);
 	if (!domc)
