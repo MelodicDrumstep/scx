@@ -375,6 +375,26 @@ impl<'a> Scheduler<'a> {
         let open_opts = opts.libbpf.clone().into_bpf_open_opts();
         let mut skel = scx_ops_open!(skel_builder, open_object, rusty, open_opts).unwrap();
 
+        // Set pin path for task type ring buffer if provided (must be done before loading)
+        // BPF maps must be pinned under /sys/fs/bpf/, so we convert the path if needed
+        if let Some(ref shm_path) = opts.task_type_shm {
+            let shm_path_str = shm_path.to_string_lossy();
+            let pin_path = if shm_path_str.starts_with("/sys/fs/bpf/") {
+                shm_path.clone()
+            } else {
+                // Convert /dev/shm/... to /sys/fs/bpf/...
+                // Extract just the filename and put it under /sys/fs/bpf/
+                let filename = shm_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("scx_rusty_task_types");
+                std::path::PathBuf::from(format!("/sys/fs/bpf/{}", filename))
+            };
+            skel.maps.task_type_ring_buffer
+                .set_pin_path(&pin_path)
+                .context("Failed to set pin path for task type ring buffer")?;
+        }
+
         // Initialize skel according to @opts.
         let domains = Arc::new(DomainGroup::new(&Topology::new()?, &opts.cpumasks)?);
 
@@ -460,15 +480,24 @@ impl<'a> Scheduler<'a> {
         let mut skel = scx_ops_load!(skel, rusty, uei)?;
         
         // Initialize task type ring buffer for dynamic updates
+        // The map is automatically pinned during load if pin path was set above
         task_type::init_task_type_ring_buffer(&mut skel)
             .context("Failed to initialize task type ring buffer")?;
-        info!("Task type ring buffer initialized. Applications can push updates dynamically.");
         
-        // Legacy support: if a file is provided, load initial task types
         if let Some(ref shm_path) = opts.task_type_shm {
-            // For backward compatibility, we could load initial values here
-            // but the ring buffer approach is preferred for dynamic updates
-            info!("Note: task_type_shm option is deprecated. Use the ring buffer API for dynamic updates.");
+            let shm_path_str = shm_path.to_string_lossy();
+            let pin_path = if shm_path_str.starts_with("/sys/fs/bpf/") {
+                shm_path.clone()
+            } else {
+                let filename = shm_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("scx_rusty_task_types");
+                std::path::PathBuf::from(format!("/sys/fs/bpf/{}", filename))
+            };
+            info!("Task type ring buffer initialized and pinned to {}. Applications can push updates dynamically.", pin_path.display());
+        } else {
+            info!("Task type ring buffer initialized. Applications can push updates dynamically.");
         }
         
         let struct_ops = Some(scx_ops_attach!(skel, rusty)?);

@@ -117,6 +117,7 @@ pub fn write_task_type_update(
 
 /// Initialize the task type ring buffer.
 /// This should be called once during scheduler initialization.
+/// Note: The pin path should be set before loading the skeleton.
 pub fn init_task_type_ring_buffer(skel: &mut BpfSkel) -> Result<()> {
     const RING_KEY: u32 = 0;
     const TASK_TYPE_RING_SIZE: usize = bpf_intf::consts_TASK_TYPE_RING_SIZE as usize;
@@ -127,7 +128,7 @@ pub fn init_task_type_ring_buffer(skel: &mut BpfSkel) -> Result<()> {
     // Initialize ring buffer: lock (4 bytes), producer (0), consumer (0), entries (all zeros)
     // Each entry is 8 bytes due to C struct padding: u32 pid (4) + u8 task_type (1) + 3 padding = 8
     // Total size: 4 (lock) + 4 (producer) + 4 (consumer) + (TASK_TYPE_RING_SIZE * 8) (entries)
-    let mut ring_data = vec![0u8; 12 + (TASK_TYPE_RING_SIZE * 8)];
+    let ring_data = vec![0u8; 12 + (TASK_TYPE_RING_SIZE * 8)];
 
     // Producer and consumer are already 0, lock is already 0
     // Just write the initialized structure

@@ -511,7 +511,7 @@ struct {
 	__uint(map_flags, 0);
 } task_type_ring_buffer SEC(".maps");
 
-#define BE_DELAY_PROB_DIVISOR 200U
+#define BE_DELAY_PROB_DIVISOR 2U
 
 static inline void stat_add(enum stat_idx idx, u64 addend)
 {
@@ -526,13 +526,21 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 {
 	u32 pid;
 	u8 *entry;
+	u8 task_type_val;
 
 	if (!taskc || !p)
 		return;
 
 	pid = READ_ONCE(p->pid);
 	entry = bpf_map_lookup_elem(&task_type_by_pid, &pid);
-	taskc->is_be_type = entry && *entry == TASK_TYPE_BE;
+	if (entry) {
+		task_type_val = *entry;
+		taskc->is_be_type = (task_type_val == TASK_TYPE_BE);
+		bpf_printk("[TASK_TYPE] Set task type for PID=%u (%s): TYPE=%s",
+			   pid, p->comm, task_type_val == TASK_TYPE_LC ? "LC" : "BE");
+	} else {
+		taskc->is_be_type = false;
+	}
 }
 
 static bool should_delay_be_task(struct task_ctx *taskc)
@@ -580,9 +588,12 @@ static void process_task_type_ring_buffer(void)
 	/* Now update the map outside the lock - verifier can clearly see unlock happened */
 	if (task_type_val == TASK_TYPE_LC || task_type_val == TASK_TYPE_BE) {
 		bpf_map_update_elem(&task_type_by_pid, &pid, &task_type_val, BPF_ANY);
+		bpf_printk("[TASK_TYPE] Added pid->task_type mapping: PID=%u TYPE=%s",
+			    pid, task_type_val == TASK_TYPE_LC ? "LC" : "BE");
 	} else {
 		/* Remove entry if invalid type */
 		bpf_map_delete_elem(&task_type_by_pid, &pid);
+		bpf_printk("[TASK_TYPE] Removed invalid task type entry: PID=%u", pid);
 	}
 }
 
@@ -1015,10 +1026,16 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (!(taskc = lookup_task_ctx_mask(p, &p_cpumask)) || !p_cpumask)
 		goto enoent;
 
-	if (should_delay_be_task(taskc)) {
-		stat_add(RUSTY_STAT_BE_DELAYED, 1);
-		goto enoent;
+	/* Check if this is a BE task during scheduling */
+	if (taskc->is_be_type) {
+		bpf_printk("[TASK_TYPE] BE task detected during scheduling: PID=%u (%s)",
+			   READ_ONCE(p->pid), p->comm);
 	}
+
+	// if (should_delay_be_task(taskc)) {
+	// 	stat_add(RUSTY_STAT_BE_DELAYED, 1);
+	// 	goto enoent;
+	// }
 
 	if (p->nr_cpus_allowed == 1) {
 		cpu = prev_cpu;
