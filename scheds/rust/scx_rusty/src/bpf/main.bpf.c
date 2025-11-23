@@ -1285,6 +1285,12 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	/* Update task type on every enqueue to catch newly added mappings */
 	assign_task_type(taskc, p);
 
+	/* Check if this is a BE task during enqueue */
+	if (taskc->task_type == 1) {
+		bpf_printk("[TASK_TYPE] BE task detected during enqueue: PID=%u (%s)",
+			   READ_ONCE(p->pid), p->comm);
+	}
+
 	domc = task_domain(taskc);
 	if (!domc)
 		return;
