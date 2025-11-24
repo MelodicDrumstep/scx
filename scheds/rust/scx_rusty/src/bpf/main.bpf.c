@@ -1041,12 +1041,15 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 	if (taskc->task_type == 1) {
 		bpf_printk("[TASK_TYPE] BE task detected during scheduling: PID=%u (%s)",
 			   READ_ONCE(p->pid), p->comm);
+		
+		/* With 0.5 probability, queue BE tasks instead of scheduling directly */
+		if ((bpf_get_prandom_u32() % 2) == 0) {
+			bpf_printk("[TASK_TYPE] BE task queued (50%% chance): PID=%u (%s)",
+				   READ_ONCE(p->pid), p->comm);
+			stat_add(RUSTY_STAT_BE_DELAYED, 1);
+			goto enoent;
+		}
 	}
-
-	// if (should_delay_be_task(taskc)) {
-	// 	stat_add(RUSTY_STAT_BE_DELAYED, 1);
-	// 	goto enoent;
-	// }
 
 	if (p->nr_cpus_allowed == 1) {
 		cpu = prev_cpu;
@@ -1285,10 +1288,22 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	/* Update task type on every enqueue to catch newly added mappings */
 	assign_task_type(taskc, p);
 
+	/* Track if this BE task should be delayed (skip CPU wakeup) */
+	bool delay_be_task = false;
+	
 	/* Check if this is a BE task during enqueue */
 	if (taskc->task_type == 1) {
 		bpf_printk("[TASK_TYPE] BE task detected during enqueue: PID=%u (%s)",
 			   READ_ONCE(p->pid), p->comm);
+		
+		/* With 0.5 probability, delay BE tasks by skipping CPU wakeup */
+		/* This delays execution without preventing enqueue (avoids stalls) */
+		if ((bpf_get_prandom_u32() % 2) == 0) {
+			bpf_printk("[TASK_TYPE] BE task delayed in enqueue (50%% chance): PID=%u (%s)",
+				   READ_ONCE(p->pid), p->comm);
+			stat_add(RUSTY_STAT_BE_DELAYED, 1);
+			delay_be_task = true;
+		}
 	}
 
 	domc = task_domain(taskc);
@@ -1302,9 +1317,12 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	    task_set_domain(p, domc->id, false)) {
 		stat_add(RUSTY_STAT_LOAD_BALANCE, 1);
 		taskc->dispatch_local = false;
-		cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
-		if (cpu < nr_cpu_ids)
-			scx_bpf_kick_cpu(cpu, 0);
+		/* For BE tasks with delay flag, skip CPU kick to delay execution */
+		if (!delay_be_task) {
+			cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
+			if (cpu < nr_cpu_ids)
+				scx_bpf_kick_cpu(cpu, 0);
+		}
 		goto dom_queue;
 	}
 
@@ -1321,12 +1339,16 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	 * so, @p would be queued on its domain's dsq but none of the CPUs in
 	 * the domain would be woken up which can induce temporary execution
 	 * stalls. Kick a domestic CPU if @p is on a foreign domain.
+	 * 
+	 * For BE tasks with delay flag, skip the CPU kick to delay execution.
 	 */
 	if (!bpf_cpumask_test_cpu(scx_bpf_task_cpu(p), cast_mask(p_cpumask))) {
-		cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
-		if (cpu < nr_cpu_ids)
-			scx_bpf_kick_cpu(cpu, 0);
-		stat_add(RUSTY_STAT_REPATRIATE, 1);
+		if (!delay_be_task) {
+			cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
+			if (cpu < nr_cpu_ids)
+				scx_bpf_kick_cpu(cpu, 0);
+			stat_add(RUSTY_STAT_REPATRIATE, 1);
+		}
 	}
 
 dom_queue:
@@ -1350,7 +1372,11 @@ dom_queue:
 	 * CPUs are highly loaded while KICK_GREEDY doesn't. Even under fairly
 	 * high utilization, KICK_GREEDY can slightly improve work-conservation.
 	 */
-	if (taskc->all_cpus) {
+	/*
+	 * For BE tasks with delay flag, skip the greedy CPU kick to delay execution.
+	 * The task is still enqueued but won't wake up idle CPUs immediately.
+	 */
+	if (taskc->all_cpus && !delay_be_task) {
 		const struct cpumask *idle_cpumask;
 
 		idle_cpumask = scx_bpf_get_idle_cpumask();
