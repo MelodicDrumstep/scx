@@ -3,6 +3,9 @@ import subprocess
 import signal
 import time
 import argparse
+import ctypes
+import ctypes.util
+import struct
 
 Ruler_BE_list = ["port0_ruler", "port1_ruler", "port5_ruler", "int_add_ruler", "l1_cache_ruler", "l2_cache_ruler", "l3_cache_ruler"]
 SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "470.lbm", "473.astar", "483.xalancbmk"]
@@ -17,6 +20,247 @@ def generate_odd_string(x):
 
 NUMA0_cores = generate_even_string(Num_total_cores)
 NUMA1_cores = generate_odd_string(Num_total_cores)
+
+# BPF map constants
+TASK_TYPE_RING_SIZE = 1024
+TASK_TYPE_LC = 0
+TASK_TYPE_BE = 1
+BPF_ANY = 0
+
+# Load libbpf
+libbpf = None
+libc = None
+
+def init_libbpf():
+    """Initialize libbpf and libc libraries"""
+    global libbpf, libc
+    if libbpf is None:
+        libbpf_path = ctypes.util.find_library("bpf")
+        if libbpf_path:
+            libbpf = ctypes.CDLL(libbpf_path)
+        else:
+            # Try common paths
+            for path in ["libbpf.so", "libbpf.so.1", "/usr/lib/x86_64-linux-gnu/libbpf.so"]:
+                try:
+                    libbpf = ctypes.CDLL(path)
+                    break
+                except OSError:
+                    continue
+        
+        if libbpf is None:
+            raise RuntimeError("Could not load libbpf library")
+        
+        # Set up function signatures
+        libbpf.bpf_obj_get.argtypes = [ctypes.POINTER(ctypes.c_char)]
+        libbpf.bpf_obj_get.restype = ctypes.c_int
+        
+        libbpf.bpf_map_lookup_elem.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
+        libbpf.bpf_map_lookup_elem.restype = ctypes.c_int
+        
+        libbpf.bpf_map_update_elem.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+        libbpf.bpf_map_update_elem.restype = ctypes.c_int
+        
+        libc = ctypes.CDLL(ctypes.util.find_library("c"))
+        libc.close.argtypes = [ctypes.c_int]
+        libc.close.restype = ctypes.c_int
+
+def open_bpf_map_fd_by_path(map_path):
+    """Open a BPF map by path and return its file descriptor"""
+    init_libbpf()
+    
+    # Convert path to bytes
+    path_bytes = map_path.encode('utf-8')
+    path_cstr = ctypes.create_string_buffer(path_bytes)
+    
+    fd = libbpf.bpf_obj_get(ctypes.cast(path_cstr, ctypes.POINTER(ctypes.c_char)))
+    if fd < 0:
+        return None
+    
+    return fd
+
+def find_bpf_map_fd(map_name):
+    """Find a BPF map by name, searching common locations"""
+    # Try common pinned paths
+    common_paths = [
+        f"/sys/fs/bpf/{map_name}",
+        f"/sys/fs/bpf/scx_rusty/{map_name}",
+        f"/sys/fs/bpf/rusty/{map_name}",
+    ]
+    
+    for path in common_paths:
+        fd = open_bpf_map_fd_by_path(path)
+        if fd is not None:
+            return fd
+    
+    # Try to find the map by iterating through /sys/fs/bpf
+    try:
+        if os.path.exists("/sys/fs/bpf"):
+            for entry in os.listdir("/sys/fs/bpf"):
+                entry_path = os.path.join("/sys/fs/bpf", entry)
+                if os.path.isdir(entry_path):
+                    map_path = os.path.join(entry_path, map_name)
+                    if os.path.exists(map_path):
+                        fd = open_bpf_map_fd_by_path(map_path)
+                        if fd is not None:
+                            return fd
+                elif entry == map_name:
+                    fd = open_bpf_map_fd_by_path(entry_path)
+                    if fd is not None:
+                        return fd
+    except OSError:
+        pass
+    
+    raise RuntimeError(
+        f"Could not find BPF map '{map_name}'. "
+        "Make sure the scheduler is running and the map is pinned."
+    )
+
+def write_task_type_update(map_fd, pid, task_type):
+    """Write a task type update to the ring buffer"""
+    init_libbpf()
+    
+    RING_KEY = 0
+    key = struct.pack('<I', RING_KEY)
+    
+    # Ring buffer structure: lock (4) + producer (4) + consumer (4) + entries (TASK_TYPE_RING_SIZE * 8)
+    value_size = 12 + (TASK_TYPE_RING_SIZE * 8)
+    value = bytearray(value_size)
+    
+    # Lookup the ring buffer
+    key_ptr = ctypes.cast(key, ctypes.c_void_p)
+    value_ptr = ctypes.cast((ctypes.c_char * value_size).from_buffer(value), ctypes.c_void_p)
+    
+    ret = libbpf.bpf_map_lookup_elem(map_fd, key_ptr, value_ptr)
+    if ret != 0:
+        errno = ctypes.get_errno()
+        raise RuntimeError(f"Failed to lookup task type ring buffer: errno {errno}")
+    
+    # Parse producer and consumer indices
+    producer = struct.unpack('<I', bytes(value[4:8]))[0]
+    consumer = struct.unpack('<I', bytes(value[8:12]))[0]
+    
+    # Check if ring buffer is full
+    diff = (producer - consumer) & 0xFFFFFFFF
+    if diff >= TASK_TYPE_RING_SIZE:
+        return False
+    
+    # Calculate the index for the new entry
+    idx = producer % TASK_TYPE_RING_SIZE
+    entry_offset = 12 + (idx * 8)
+    
+    if entry_offset + 8 > len(value):
+        raise RuntimeError("Ring buffer entry out of bounds")
+    
+    # Write the entry: pid (u32, 4 bytes) + task_type (u8, 1 byte) + padding (3 bytes)
+    pid_bytes = struct.pack('<I', pid)
+    value[entry_offset:entry_offset + 4] = pid_bytes
+    value[entry_offset + 4] = task_type
+    value[entry_offset + 5:entry_offset + 8] = b'\x00\x00\x00'
+    
+    # Update producer index
+    new_producer = (producer + 1) & 0xFFFFFFFF
+    producer_bytes = struct.pack('<I', new_producer)
+    value[4:8] = producer_bytes
+    
+    # Write back to the map
+    value_ptr = ctypes.cast((ctypes.c_char * len(value)).from_buffer(value), ctypes.c_void_p)
+    ret = libbpf.bpf_map_update_elem(map_fd, key_ptr, value_ptr, BPF_ANY)
+    if ret != 0:
+        errno = ctypes.get_errno()
+        raise RuntimeError(f"Failed to update task type ring buffer: errno {errno}")
+    
+    return True
+
+def get_docker_container_pid(container_name):
+    """Get the main process PID of a docker container"""
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Pid}}", container_name],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        pid = int(result.stdout.strip())
+        return pid
+    except (subprocess.CalledProcessError, ValueError):
+        return None
+
+def get_child_pids(pid):
+    """Get all child PIDs of a process"""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-P", str(pid)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        pids = [int(p) for p in result.stdout.strip().split('\n') if p]
+        return pids
+    except (subprocess.CalledProcessError, ValueError):
+        return []
+
+def get_descendant_pids(pid, max_depth=3):
+    """Get all descendant PIDs of a process (recursively)"""
+    pids = []
+    current_level = [pid]
+    
+    for depth in range(max_depth):
+        next_level = []
+        for parent_pid in current_level:
+            children = get_child_pids(parent_pid)
+            pids.extend(children)
+            next_level.extend(children)
+        current_level = next_level
+        if not current_level:
+            break
+    
+    return pids
+
+def get_all_thread_ids(pid):
+    """Get all thread IDs (TIDs) for a process, including the main thread"""
+    thread_ids = []
+    task_dir = f"/proc/{pid}/task"
+    
+    if not os.path.exists(task_dir):
+        return thread_ids
+    
+    try:
+        for tid_str in os.listdir(task_dir):
+            try:
+                tid = int(tid_str)
+                thread_ids.append(tid)
+            except ValueError:
+                continue
+    except (OSError, PermissionError):
+        pass
+    
+    return thread_ids
+
+def get_process_group_pids(pid):
+    """Get all PIDs in the same process group as the given PID"""
+    try:
+        pgid = os.getpgid(pid)
+        result = subprocess.run(
+            ["pgrep", "-g", str(pgid)],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            return [int(p) for p in result.stdout.strip().split('\n') if p]
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        pass
+    return []
+
+def get_all_threads_for_processes(pids):
+    """Get all thread IDs for a list of process PIDs"""
+    all_threads = []
+    for pid in pids:
+        threads = get_all_thread_ids(pid)
+        all_threads.extend(threads)
+        # Also include the PID itself (main thread TID == PID)
+        if pid not in all_threads:
+            all_threads.append(pid)
+    return all_threads
 
 def gen_ruler_BE_script(BE_type, num_cores):
     script = f"""#!/bin/bash
@@ -93,7 +337,7 @@ def kill_all_spec_processes():
     
     print("Killed all SPEC processes")
 
-def run(LC_type, BE_type, num_cores, measure_IPC, NUMA_unaware):
+def run(LC_type, BE_type, num_cores, measure_IPC, NUMA_unaware, task_type_shm=None):
     os.makedirs(LC_type, exist_ok=True)
     os.makedirs(f"{LC_type}/{BE_type}", exist_ok=True)
 
@@ -149,6 +393,38 @@ def run(LC_type, BE_type, num_cores, measure_IPC, NUMA_unaware):
 
     print(f"LC_cmd : {LC_cmd}, BE_cmd : {BE_cmd}")
 
+    # Open BPF map if task_type_shm is provided
+    map_fd = None
+    if task_type_shm:
+        try:
+            if task_type_shm.startswith("/sys/fs/bpf/"):
+                map_name = os.path.basename(task_type_shm)
+                if not map_name:
+                    map_name = "task_type_ring_buffer"
+                print(f"Trying BPF map path: {task_type_shm}")
+                map_fd = open_bpf_map_fd_by_path(task_type_shm)
+                if map_fd is None:
+                    print(f"Direct path failed, searching for BPF map: {map_name}")
+                    map_fd = find_bpf_map_fd(map_name)
+            else:
+                map_name = os.path.basename(task_type_shm) if os.path.basename(task_type_shm) else task_type_shm
+                if not map_name:
+                    map_name = "task_type_ring_buffer"
+                if map_name != "task_type_ring_buffer":
+                    try:
+                        map_fd = find_bpf_map_fd(map_name)
+                    except:
+                        pass
+                if map_fd is None:
+                    map_fd = find_bpf_map_fd("task_type_ring_buffer")
+            
+            if map_fd is None:
+                raise RuntimeError("Could not find or open BPF map")
+            print(f"Successfully opened BPF map (FD: {map_fd})")
+        except Exception as e:
+            print(f"Warning: Failed to find/open BPF map: {e}")
+            print("Continuing without task type mapping...")
+
     print("Starting background processes (BE)...")
     be_process = subprocess.Popen(BE_cmd,
                                 stdout=open(f"{LC_type}/{BE_type}/BE.log", "w"), 
@@ -157,6 +433,115 @@ def run(LC_type, BE_type, num_cores, measure_IPC, NUMA_unaware):
                                 preexec_fn=os.setsid)
 
     print(f"BE process PID: {be_process.pid}")
+    
+    # Collect BE PIDs and write to ring buffer
+    be_pids = []
+    if map_fd is not None:
+        # Wait for processes to start
+        time.sleep(1.5)
+        
+        be_pids.append(be_process.pid)
+        pgid_pids = get_process_group_pids(be_process.pid)
+        be_pids.extend(pgid_pids)
+        
+        if BE_type in SPEC_2006_BE_list:
+            # For SPEC benchmarks, get descendants and find by name
+            descendant_pids = get_descendant_pids(be_process.pid, max_depth=5)
+            be_pids.extend(descendant_pids)
+            
+            # Find SPEC benchmark processes by name
+            try:
+                benchmark_name = BE_type.split('.')[-1]
+                result = subprocess.run(
+                    ["pgrep", "-f", benchmark_name],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    spec_pids = [int(p) for p in result.stdout.strip().split('\n') if p]
+                    be_pids.extend(spec_pids)
+                    for spec_pid in spec_pids:
+                        spec_descendants = get_descendant_pids(spec_pid, max_depth=3)
+                        be_pids.extend(spec_descendants)
+            except:
+                pass
+        else:
+            descendant_pids = get_descendant_pids(be_process.pid, max_depth=3)
+            be_pids.extend(descendant_pids)
+        
+        # For ruler BE scripts, find processes by name
+        if BE_type in Ruler_BE_list:
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", BE_type],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    script_pids = [int(p) for p in result.stdout.strip().split('\n') if p]
+                    be_pids.extend(script_pids)
+                    for script_pid in script_pids:
+                        script_descendants = get_descendant_pids(script_pid, max_depth=2)
+                        be_pids.extend(script_descendants)
+            except:
+                pass
+        
+        # Wait a bit more and refresh
+        time.sleep(0.5)
+        if BE_type in SPEC_2006_BE_list:
+            # Refresh for SPEC benchmarks
+            descendant_pids = get_descendant_pids(be_process.pid, max_depth=5)
+            be_pids.extend(descendant_pids)
+            try:
+                benchmark_name = BE_type.split('.')[-1]
+                result = subprocess.run(
+                    ["pgrep", "-f", benchmark_name],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    spec_pids = [int(p) for p in result.stdout.strip().split('\n') if p]
+                    be_pids.extend(spec_pids)
+            except:
+                pass
+        
+        # Get all threads for all BE processes
+        unique_be_pids = sorted(set(be_pids))
+        be_threads = get_all_threads_for_processes(unique_be_pids)
+        
+        # For SPEC benchmarks, do one more pass after waiting longer
+        if BE_type in SPEC_2006_BE_list:
+            time.sleep(2.0)
+            # Refresh PIDs one more time
+            descendant_pids = get_descendant_pids(be_process.pid, max_depth=5)
+            be_pids.extend(descendant_pids)
+            pgid_pids = get_process_group_pids(be_process.pid)
+            be_pids.extend(pgid_pids)
+            try:
+                benchmark_name = BE_type.split('.')[-1]
+                result = subprocess.run(
+                    ["pgrep", "-f", benchmark_name],
+                    capture_output=True,
+                    text=True
+                )
+                if result.returncode == 0:
+                    spec_pids = [int(p) for p in result.stdout.strip().split('\n') if p]
+                    be_pids.extend(spec_pids)
+            except:
+                pass
+            unique_be_pids = sorted(set(be_pids))
+            be_threads.extend(get_all_threads_for_processes(unique_be_pids))
+        
+        # Write BE threads to ring buffer
+        print(f"\nWriting BE task type mappings to ring buffer...")
+        for tid in set(be_threads):
+            try:
+                if write_task_type_update(map_fd, tid, TASK_TYPE_BE):
+                    print(f"  Written: TID {tid} -> BE")
+                else:
+                    print(f"  Warning: Ring buffer full, could not write TID {tid} -> BE")
+            except Exception as e:
+                print(f"  Error writing TID {tid} -> BE: {e}")
     
     if measure_IPC:
         # Start perf stat processes for core 0 and core 20
@@ -191,6 +576,57 @@ def run(LC_type, BE_type, num_cores, measure_IPC, NUMA_unaware):
                                     stderr=subprocess.STDOUT)
         print(f"LC process PID: {lc_process.pid}")
         
+        # Collect LC PIDs and write to ring buffer
+        lc_pids = []
+        if map_fd is not None:
+            # Wait for processes to start
+            time.sleep(1.0)
+            
+            if LC_type == "Graph-Analytics":
+                try:
+                    result = subprocess.run(
+                        ["docker", "ps", "--format", "{{.ID}} {{.Names}}", "--filter", "ancestor=cloudsuite/graph-analytics"],
+                        capture_output=True,
+                        text=True,
+                        check=True
+                    )
+                    if result.stdout.strip():
+                        container_id = result.stdout.strip().split('\n')[-1].split()[0]
+                        container_pid = get_docker_container_pid(container_id)
+                        if container_pid:
+                            lc_pids.append(container_pid)
+                            descendant_pids = get_descendant_pids(container_pid, max_depth=3)
+                            lc_pids.extend(descendant_pids)
+                except:
+                    pass
+                lc_pids.append(lc_process.pid)
+            elif LC_type == "Data-Analytics":
+                for container_name in ["data-master", "data-slave01"]:
+                    container_pid = get_docker_container_pid(container_name)
+                    if container_pid:
+                        lc_pids.append(container_pid)
+                        descendant_pids = get_descendant_pids(container_pid, max_depth=3)
+                        lc_pids.extend(descendant_pids)
+                lc_pids.append(lc_process.pid)
+            else:
+                lc_pids.append(lc_process.pid)
+                descendant_pids = get_descendant_pids(lc_process.pid, max_depth=3)
+                lc_pids.extend(descendant_pids)
+            
+            # Get all threads for all LC processes
+            lc_threads = get_all_threads_for_processes(lc_pids)
+            
+            # Write LC threads to ring buffer
+            print(f"\nWriting LC task type mappings to ring buffer...")
+            for tid in set(lc_threads):
+                try:
+                    if write_task_type_update(map_fd, tid, TASK_TYPE_LC):
+                        print(f"  Written: TID {tid} -> LC")
+                    else:
+                        print(f"  Warning: Ring buffer full, could not write TID {tid} -> LC")
+                except Exception as e:
+                    print(f"  Error writing TID {tid} -> LC: {e}")
+        
         # Wait for LC process
         if lc_process:
             try:
@@ -198,9 +634,25 @@ def run(LC_type, BE_type, num_cores, measure_IPC, NUMA_unaware):
                 print("LC process completed")
             except Exception as e:
                 print(f"Error waiting for LC process: {e}")
-        pass  # LC process launching is temporarily commented out
     except Exception as e:
         print(f"Error running LC process: {e}")
+    
+    # Wait for BE process to complete
+    print("\nWaiting for BE process to complete...")
+    try:
+        be_process.wait()
+        print("BE process completed")
+    except Exception as e:
+        print(f"Error waiting for BE process: {e}")
+    finally:
+        # Close BPF map FD if opened
+        if map_fd is not None:
+            try:
+                init_libbpf()
+                if libc:
+                    libc.close(map_fd)
+            except:
+                pass
     
     print("All processes completed")
     
@@ -272,6 +724,7 @@ if __name__ == "__main__":
     parser.add_argument('-n', '--num_cores', type = int, help = 'The number of cores to for LC and BE each. If not given, we won\'t bind cores.')
     parser.add_argument('--measure_IPC', action = 'store_true', help = 'To measure the IPC of two cores using perf. Only valid if \"num_cores\" is set')
     parser.add_argument('--NUMA_unaware', action = 'store_true', help = 'To only set one NUMA node, only needed when \"num_cores\" is not given.')
+    parser.add_argument('--task-type-shm', type = str, help = 'Path to the BPF map for task type ring buffer (e.g., /sys/fs/bpf/scx_rusty_task_types)')
     args = parser.parse_args()
     
     # num_cores == None means we do not bind cores
@@ -296,11 +749,11 @@ if __name__ == "__main__":
             print("Warning : \"run all\" is set, ignoring given BE")
         if args.run_all_ruler:
             for BE_type in Ruler_BE_list:
-                run(LC_type, BE_type, num_cores, args.measure_IPC, args.NUMA_unaware)            
+                run(LC_type, BE_type, num_cores, args.measure_IPC, args.NUMA_unaware, args.task_type_shm)            
         if args.run_all_SPEC:
             for BE_type in SPEC_2006_BE_list:
-                run(LC_type, BE_type, num_cores, args.measure_IPC, args.NUMA_unaware)
+                run(LC_type, BE_type, num_cores, args.measure_IPC, args.NUMA_unaware, args.task_type_shm)
         exit()
 
-    run(LC_type, args.BE, num_cores, args.measure_IPC, args.NUMA_unaware)
+    run(LC_type, args.BE, num_cores, args.measure_IPC, args.NUMA_unaware, args.task_type_shm)
     
