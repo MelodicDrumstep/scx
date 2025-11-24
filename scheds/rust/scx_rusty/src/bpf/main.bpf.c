@@ -1031,8 +1031,11 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 	refresh_tune_params();
 	process_task_type_ring_buffer();
 
-	if (!(taskc = lookup_task_ctx_mask(p, &p_cpumask)) || !p_cpumask)
-		goto enoent;
+	if (!(taskc = lookup_task_ctx_mask(p, &p_cpumask)) || !p_cpumask) {
+		/* Fallback to prev_cpu if task lookup fails */
+		scx_bpf_put_idle_cpumask(idle_smtmask);
+		return prev_cpu >= 0 && prev_cpu < nr_cpu_ids ? prev_cpu : 0;
+	}
 
 	/* Update task type before checking (in case it was just added) */
 	assign_task_type(taskc, p);
@@ -1043,11 +1046,17 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 			   READ_ONCE(p->pid), p->comm);
 		
 		/* With 0.5 probability, queue BE tasks instead of scheduling directly */
+		/* Still return a valid CPU - the task will be enqueued in enqueue() */
 		if ((bpf_get_prandom_u32() % 2) == 0) {
 			bpf_printk("[TASK_TYPE] BE task queued (50%% chance): PID=%u (%s)",
 				   READ_ONCE(p->pid), p->comm);
 			stat_add(RUSTY_STAT_BE_DELAYED, 1);
-			goto enoent;
+			/* Return a valid CPU from the task's cpumask or prev_cpu */
+			cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
+			if (cpu >= nr_cpu_ids)
+				cpu = prev_cpu;
+			scx_bpf_put_idle_cpumask(idle_smtmask);
+			return cpu >= 0 && cpu < nr_cpu_ids ? cpu : prev_cpu;
 		}
 	}
 
@@ -1158,20 +1167,25 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 		 * 2. Move the task to any CPU where greedy allocation is preferred
 		 * 3. Move the task to any CPU
 		 */
-		if (unlikely(is_offline_cpu(prev_cpu)))
-			domc = NULL;
-		else if (!(domc = lookup_dom_ctx(dom_id)))
-			goto enoent;
+		if (unlikely(is_offline_cpu(prev_cpu))) {
+			/* Skip greedy path for offline CPUs */
+			goto skip_greedy;
+		} else if (!(domc = lookup_dom_ctx(dom_id))) {
+			/* Fallback: skip greedy path and use normal queuing */
+			goto skip_greedy;
+		}
 
 		if (!(lb_domain = lb_domain_get(domc->id))) {
 			scx_bpf_error("Failed to lookup domain map value");
-			goto enoent;
+			/* Fallback: skip greedy path and use normal queuing */
+			goto skip_greedy;
 		}
 
 		tmp_direct_greedy = direct_greedy_cpumask;
 		if (!tmp_direct_greedy) {
 			scx_bpf_error("Failed to lookup direct_greedy mask");
-			goto enoent;
+			/* Fallback: skip greedy path and use normal queuing */
+			goto skip_greedy;
 		}
 		/*
 		 * By default, only look for an idle core in the current NUMA
@@ -1185,13 +1199,15 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 			node_mask = lb_domain->node_cpumask;
 			if (!node_mask) {
 				scx_bpf_error("Failed to lookup node mask");
-				goto enoent;
+				/* Fallback: skip greedy path and use normal queuing */
+				goto skip_greedy;
 			}
 
 			tmp_cpumask = scx_percpu_bpfmask();
 			if (!tmp_cpumask) {
 				scx_bpf_error("Failed to lookup tmp cpumask");
-				goto enoent;
+				/* Fallback: skip greedy path and use normal queuing */
+				goto skip_greedy;
 			}
 			bpf_cpumask_and(tmp_cpumask,
 					cast_mask(node_mask),
@@ -1240,6 +1256,7 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 		}
 	}
 
+skip_greedy:
 	/*
 	 * We're going to queue on the domestic domain's DSQ. @prev_cpu may be
 	 * in a different domain. Returning an out-of-domain CPU can lead to
@@ -1254,17 +1271,20 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 			cpu = prev_cpu;
 	}
 
+	/* Ensure we return a valid CPU ID */
+	if (cpu < 0 || cpu >= nr_cpu_ids)
+		cpu = prev_cpu >= 0 && prev_cpu < nr_cpu_ids ? prev_cpu : 0;
+
 	scx_bpf_put_idle_cpumask(idle_smtmask);
 	return cpu;
 
 direct:
 	taskc->dispatch_local = true;
+	/* Ensure we return a valid CPU ID */
+	if (cpu < 0 || cpu >= nr_cpu_ids)
+		cpu = prev_cpu >= 0 && prev_cpu < nr_cpu_ids ? prev_cpu : 0;
 	scx_bpf_put_idle_cpumask(idle_smtmask);
 	return cpu;
-
-enoent:
-	scx_bpf_put_idle_cpumask(idle_smtmask);
-	return -ENOENT;
 }
 
 static void place_task_dl(struct task_struct *p, struct task_ctx *taskc,
