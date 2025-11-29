@@ -511,7 +511,7 @@ struct {
 	__uint(map_flags, 0);
 } task_type_ring_buffer SEC(".maps");
 
-#define BE_DELAY_PROB_DIVISOR 2U
+#define BE_DELAY_PROB_PERCENTAGE 99U
 
 static inline void stat_add(enum stat_idx idx, u64 addend)
 {
@@ -540,13 +540,13 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 		/* Convert TASK_TYPE_LC (0) to 0, TASK_TYPE_BE (1) to 1 */
 		taskc->task_type = (s8)task_type_val;
 		/* Only log when task type changes */
-		if (old_task_type != taskc->task_type && debug >= 2) {
+		if (debug >= 2 && old_task_type != taskc->task_type) {
 			bpf_printk("[TASK_TYPE] Set task type for PID=%u (%s): TYPE=%s",
 				   pid, p->comm, task_type_val == TASK_TYPE_LC ? "LC" : "BE");
 		}
 	} else {
 		/* Only log if task had a type and now has none */
-		if (old_task_type != -1 && debug >= 2) {
+		if (debug >= 2 && old_task_type != -1) {
 			bpf_printk("[TASK_TYPE] Removed task type for PID=%u (%s)",
 				   pid, p->comm);
 		}
@@ -559,56 +559,13 @@ static bool should_delay_be_task(struct task_ctx *taskc)
 	if (!taskc || taskc->task_type != 1)
 		return false;
 
-	return (bpf_get_prandom_u32() % BE_DELAY_PROB_DIVISOR) == 0;
+	return (bpf_get_prandom_u32() % 100) < BE_DELAY_PROB_PERCENTAGE;
 }
 
 /*
- * Process one task type update from the ring buffer.
- * Called periodically during scheduling to update task_type_by_pid map.
- * Processes only one entry per call to make lock/unlock clear to verifier.
+ * process_task_type_ring_buffer() has been moved to userspace.
+ * Userspace periodically processes the ring buffer and updates task_type_by_pid map directly.
  */
-static void process_task_type_ring_buffer(void)
-{
-	const u32 zero = 0;
-	struct task_type_ring *ring;
-	u32 idx;
-	struct task_type_entry *entry;
-	u32 pid;
-	u8 task_type_val;
-
-	ring = bpf_map_lookup_elem(&task_type_ring_buffer, &zero);
-	if (!ring)
-		return;
-
-	/* Lock, read one entry, update consumer, unlock */
-	bpf_spin_lock(&ring->lock);
-
-	if (ring->consumer == ring->producer) {
-		bpf_spin_unlock(&ring->lock);
-		return; /* Ring buffer is empty */
-	}
-
-	idx = ring->consumer % TASK_TYPE_RING_SIZE;
-	entry = &ring->entries[idx];
-	pid = entry->pid;
-	task_type_val = entry->task_type;
-	ring->consumer++;
-
-	bpf_spin_unlock(&ring->lock);
-
-	/* Now update the map outside the lock - verifier can clearly see unlock happened */
-	if (task_type_val == TASK_TYPE_LC || task_type_val == TASK_TYPE_BE) {
-		bpf_map_update_elem(&task_type_by_pid, &pid, &task_type_val, BPF_ANY);
-		if (debug >= 2)
-			bpf_printk("[TASK_TYPE] Added pid->task_type mapping: PID=%u TYPE=%s",
-				    pid, task_type_val == TASK_TYPE_LC ? "LC" : "BE");
-	} else {
-		/* Remove entry if invalid type */
-		bpf_map_delete_elem(&task_type_by_pid, &pid);
-		if (debug >= 2)
-			bpf_printk("[TASK_TYPE] Removed invalid task type entry: PID=%u", pid);
-	}
-}
 
 /*
  * Userspace tuner will frequently update the following struct with tuning
@@ -1031,7 +988,6 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 	s32 cpu;
 
 	refresh_tune_params();
-	process_task_type_ring_buffer();
 
 	if (!(taskc = lookup_task_ctx_mask(p, &p_cpumask)) || !p_cpumask) {
 		/* Fallback to prev_cpu if task lookup fails */
@@ -1042,26 +998,24 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 	/* Update task type before checking (in case it was just added) */
 	assign_task_type(taskc, p);
 
-	/* Check if this is a BE task during scheduling */
-	if (taskc->task_type == 1) {
-		if (debug >= 2)
+	/* With 0.99 probability, queue BE tasks instead of scheduling directly */
+	/* Still return a valid CPU - the task will be enqueued in enqueue() */
+	if (should_delay_be_task(taskc)) {
+		// if (debug >= 2) {
 			bpf_printk("[TASK_TYPE] BE task detected during scheduling: PID=%u (%s)",
-				   READ_ONCE(p->pid), p->comm);
-		
-		/* With 0.5 probability, queue BE tasks instead of scheduling directly */
-		/* Still return a valid CPU - the task will be enqueued in enqueue() */
-		if ((bpf_get_prandom_u32() % 2) == 0) {
-			if (debug >= 2)
-				bpf_printk("[TASK_TYPE] BE task queued (50%% chance): PID=%u (%s)",
-					   READ_ONCE(p->pid), p->comm);
-			stat_add(RUSTY_STAT_BE_DELAYED, 1);
-			/* Return a valid CPU from the task's cpumask or prev_cpu */
-			cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
-			if (cpu >= nr_cpu_ids)
-				cpu = prev_cpu;
-			scx_bpf_put_idle_cpumask(idle_smtmask);
-			return cpu >= 0 && cpu < nr_cpu_ids ? cpu : prev_cpu;
-		}
+				READ_ONCE(p->pid), p->comm);
+			bpf_printk("[TASK_TYPE] BE task queued (99%% chance): PID=%u (%s)",
+					READ_ONCE(p->pid), p->comm);
+		// }
+		stat_add(RUSTY_STAT_BE_DELAYED, 1);
+		/* Ensure task goes to domain DSQ, not local DSQ (makes it pending) */
+		taskc->dispatch_local = false;
+		/* Return a valid CPU from the task's cpumask or prev_cpu */
+		cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
+		if (cpu >= nr_cpu_ids)
+			cpu = prev_cpu;
+		scx_bpf_put_idle_cpumask(idle_smtmask);
+		return cpu >= 0 && cpu < nr_cpu_ids ? cpu : prev_cpu;
 	}
 
 	if (p->nr_cpus_allowed == 1) {
@@ -1317,15 +1271,15 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	
 	/* Check if this is a BE task during enqueue */
 	if (taskc->task_type == 1) {
-		if (debug >= 2)
+		// if (debug >= 2)
 			bpf_printk("[TASK_TYPE] BE task detected during enqueue: PID=%u (%s)",
 				   READ_ONCE(p->pid), p->comm);
 		
-		/* With 0.5 probability, delay BE tasks by skipping CPU wakeup */
+		/* With 0.99 probability, delay BE tasks by skipping CPU wakeup */
 		/* This delays execution without preventing enqueue (avoids stalls) */
-		if ((bpf_get_prandom_u32() % 2) == 0) {
-			if (debug >= 2)
-				bpf_printk("[TASK_TYPE] BE task delayed in enqueue (50%% chance): PID=%u (%s)",
+		if (should_delay_be_task(taskc)) {
+			// if (debug >= 2)
+				bpf_printk("[TASK_TYPE] BE task delayed in enqueue (99%% chance): PID=%u (%s)",
 					   READ_ONCE(p->pid), p->comm);
 			stat_add(RUSTY_STAT_BE_DELAYED, 1);
 			delay_be_task = true;
