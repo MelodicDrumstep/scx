@@ -512,6 +512,7 @@ struct {
 } task_type_ring_buffer SEC(".maps");
 
 #define BE_DELAY_PROB_PERCENTAGE 99U
+#define BE_DISPATCH_PROB_PERCENTAGE 1U  /* 1% chance to dispatch from pending DSQ */
 
 static inline void stat_add(enum stat_idx idx, u64 addend)
 {
@@ -998,24 +999,20 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 	/* Update task type before checking (in case it was just added) */
 	assign_task_type(taskc, p);
 
-	/* With 0.99 probability, queue BE tasks instead of scheduling directly */
-	/* Still return a valid CPU - the task will be enqueued in enqueue() */
+	/* BE tasks will be handled in enqueue() - just return a valid CPU */
 	if (should_delay_be_task(taskc)) {
 		if (debug >= 2) {
 			bpf_printk("[TASK_TYPE] BE task detected during scheduling: PID=%u (%s)",
 				READ_ONCE(p->pid), p->comm);
-			bpf_printk("[TASK_TYPE] BE task queued (99%% chance): PID=%u (%s)",
-					READ_ONCE(p->pid), p->comm);
 		}
-		stat_add(RUSTY_STAT_BE_DELAYED, 1);
-		/* Ensure task goes to domain DSQ, not local DSQ (makes it pending) */
-		taskc->dispatch_local = false;
-		/* Return a valid CPU from the task's cpumask or prev_cpu */
+		/* Return a valid CPU - the task will be enqueued to pending DSQ in enqueue() */
 		cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
 		if (cpu >= nr_cpu_ids)
 			cpu = prev_cpu;
+		if (cpu < 0 || cpu >= nr_cpu_ids)
+			cpu = prev_cpu >= 0 && prev_cpu < nr_cpu_ids ? prev_cpu : 0;
 		scx_bpf_put_idle_cpumask(idle_smtmask);
-		return cpu >= 0 && cpu < nr_cpu_ids ? cpu : prev_cpu;
+		return cpu;
 	}
 
 	if (p->nr_cpus_allowed == 1) {
@@ -1265,25 +1262,27 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 
 	/* Update task type on every enqueue to catch newly added mappings */
 	assign_task_type(taskc, p);
-
-	/* Track if this BE task should be delayed (skip CPU wakeup) */
-	bool delay_be_task = false;
 	
-	/* Check if this is a BE task during enqueue */
-	if (taskc->task_type == 1) {
-		if (debug >= 2)
-			bpf_printk("[TASK_TYPE] BE task detected during enqueue: PID=%u (%s)",
-				   READ_ONCE(p->pid), p->comm);
-		
-		/* With 0.99 probability, delay BE tasks by skipping CPU wakeup */
-		/* This delays execution without preventing enqueue (avoids stalls) */
-		if (should_delay_be_task(taskc)) {
-			if (debug >= 2)
-				bpf_printk("[TASK_TYPE] BE task delayed in enqueue (99%% chance): PID=%u (%s)",
-					   READ_ONCE(p->pid), p->comm);
-			stat_add(RUSTY_STAT_BE_DELAYED, 1);
-			delay_be_task = true;
+	/* Check if this is a BE task - enqueue to pending DSQ */
+	if (should_delay_be_task(taskc)) {
+		if (debug >= 2) {
+			bpf_printk("[TASK_TYPE] BE task enqueued to pending DSQ: PID=%u (%s)",
+				READ_ONCE(p->pid), p->comm);
 		}
+		stat_add(RUSTY_STAT_BE_DELAYED, 1);
+		
+		/* Enqueue BE task to pending DSQ */
+		/* Need to set deadline and vtime before inserting */
+		domc = task_domain(taskc);
+		if (domc) {
+			clamp_task_vtime(p, taskc, enq_flags);
+			scx_bpf_dsq_insert_vtime(p, PENDING_DSQ_ID, slice_ns, taskc->deadline, enq_flags);
+		} else {
+			/* Fallback: use simple insert if domain lookup fails */
+			scx_bpf_dsq_insert(p, PENDING_DSQ_ID, slice_ns, enq_flags);
+		}
+		
+		return;
 	}
 
 	domc = task_domain(taskc);
@@ -1297,12 +1296,9 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	    task_set_domain(p, domc->id, false)) {
 		stat_add(RUSTY_STAT_LOAD_BALANCE, 1);
 		taskc->dispatch_local = false;
-		/* For BE tasks with delay flag, skip CPU kick to delay execution */
-		if (!delay_be_task) {
-			cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
-			if (cpu < nr_cpu_ids)
-				scx_bpf_kick_cpu(cpu, 0);
-		}
+		cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
+		if (cpu < nr_cpu_ids)
+			scx_bpf_kick_cpu(cpu, 0);
 		goto dom_queue;
 	}
 
@@ -1320,15 +1316,12 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	 * the domain would be woken up which can induce temporary execution
 	 * stalls. Kick a domestic CPU if @p is on a foreign domain.
 	 * 
-	 * For BE tasks with delay flag, skip the CPU kick to delay execution.
 	 */
 	if (!bpf_cpumask_test_cpu(scx_bpf_task_cpu(p), cast_mask(p_cpumask))) {
-		if (!delay_be_task) {
-			cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
-			if (cpu < nr_cpu_ids)
-				scx_bpf_kick_cpu(cpu, 0);
-			stat_add(RUSTY_STAT_REPATRIATE, 1);
-		}
+		cpu = bpf_cpumask_any_distribute(cast_mask(p_cpumask));
+		if (cpu < nr_cpu_ids)
+			scx_bpf_kick_cpu(cpu, 0);
+		stat_add(RUSTY_STAT_REPATRIATE, 1);
 	}
 
 dom_queue:
@@ -1356,7 +1349,7 @@ dom_queue:
 	 * For BE tasks with delay flag, skip the greedy CPU kick to delay execution.
 	 * The task is still enqueued but won't wake up idle CPUs immediately.
 	 */
-	if (taskc->all_cpus && !delay_be_task) {
+	if (taskc->all_cpus) {
 		const struct cpumask *idle_cpumask;
 
 		idle_cpumask = scx_bpf_get_idle_cpumask();
@@ -1495,6 +1488,16 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	if (unlikely(is_offline_cpu(cpu)))
 		return;
+
+	/* Check pending DSQ with 1% probability */
+	if ((bpf_get_prandom_u32() % 100) < BE_DISPATCH_PROB_PERCENTAGE) {
+		if (scx_bpf_dsq_move_to_local(PENDING_DSQ_ID)) {
+			stat_add(RUSTY_STAT_BE_DELAYED, 1);
+			if (debug >= 2)
+				bpf_printk("[TASK_TYPE] Dispatched BE task from pending DSQ on CPU %d", cpu);
+			return;
+		}
+	}
 
 	if (scx_bpf_dsq_move_to_local(curr_dom)) {
 		stat_add(RUSTY_STAT_DSQ_DISPATCH, 1);
@@ -2103,6 +2106,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rusty_init)
 		ret = create_dom(i);
 		if (ret)
 			return ret;
+	}
+
+	/* Create pending DSQ for BE tasks */
+	ret = scx_bpf_create_dsq(PENDING_DSQ_ID, 0);
+	if (ret < 0) {
+		scx_bpf_error("Failed to create pending DSQ %u (%d)", PENDING_DSQ_ID, ret);
+		return ret;
 	}
 
 	bpf_for(i, 0, nr_cpu_ids) {

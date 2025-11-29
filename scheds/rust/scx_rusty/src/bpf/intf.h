@@ -32,6 +32,7 @@ enum consts {
 	MAX_NUMA_NODES		= MAX_DOMS,	/* Assume at least 1 domain per NUMA node */
 	CACHELINE_SIZE		= 64,
 	NO_DOM_FOUND		= MAX_DOMS + 1,
+	PENDING_DSQ_ID		= MAX_DOMS + 2,	/* DSQ for pending BE tasks */
 
 	LB_DEFAULT_WEIGHT	= 100,
 	LB_MIN_WEIGHT		= 1,
