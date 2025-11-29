@@ -1001,12 +1001,12 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 	/* With 0.99 probability, queue BE tasks instead of scheduling directly */
 	/* Still return a valid CPU - the task will be enqueued in enqueue() */
 	if (should_delay_be_task(taskc)) {
-		// if (debug >= 2) {
+		if (debug >= 2) {
 			bpf_printk("[TASK_TYPE] BE task detected during scheduling: PID=%u (%s)",
 				READ_ONCE(p->pid), p->comm);
 			bpf_printk("[TASK_TYPE] BE task queued (99%% chance): PID=%u (%s)",
 					READ_ONCE(p->pid), p->comm);
-		// }
+		}
 		stat_add(RUSTY_STAT_BE_DELAYED, 1);
 		/* Ensure task goes to domain DSQ, not local DSQ (makes it pending) */
 		taskc->dispatch_local = false;
@@ -1271,14 +1271,14 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	
 	/* Check if this is a BE task during enqueue */
 	if (taskc->task_type == 1) {
-		// if (debug >= 2)
+		if (debug >= 2)
 			bpf_printk("[TASK_TYPE] BE task detected during enqueue: PID=%u (%s)",
 				   READ_ONCE(p->pid), p->comm);
 		
 		/* With 0.99 probability, delay BE tasks by skipping CPU wakeup */
 		/* This delays execution without preventing enqueue (avoids stalls) */
 		if (should_delay_be_task(taskc)) {
-			// if (debug >= 2)
+			if (debug >= 2)
 				bpf_printk("[TASK_TYPE] BE task delayed in enqueue (99%% chance): PID=%u (%s)",
 					   READ_ONCE(p->pid), p->comm);
 			stat_add(RUSTY_STAT_BE_DELAYED, 1);

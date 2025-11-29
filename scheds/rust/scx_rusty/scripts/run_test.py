@@ -286,8 +286,8 @@ def collect_and_write_be_threads(map_fd, be_process_pid, BE_type, stop_event, de
                 descendant_pids = get_descendant_pids(be_process_pid, max_depth=5)
                 be_pids.extend(descendant_pids)
 
-                # DEBUGING
-                print(f"DESCENDANT PIDs: {descendant_pids}")
+                # # DEBUGING
+                # print(f"DESCENDANT PIDs: {descendant_pids}")
                 
                 # Get all threads for all BE processes
                 unique_be_pids = sorted(set(be_pids))
@@ -482,32 +482,6 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
                                 preexec_fn=os.setsid)
 
     print(f"BE process PID: {be_process.pid}")
-    
-    # Start periodic BE thread updates if map_fd is available or in debug mode
-    be_update_thread = None
-    be_update_stop = threading.Event()
-    
-    if map_fd is not None or debug_mode:
-        # Wait for processes to start
-        time.sleep(1.5)
-        
-        if debug_mode:
-            print(f"\n[DEBUG MODE] Starting periodic BE thread monitoring...")
-        else:
-            print(f"\nStarting periodic BE task type updates...")
-        print(f"BE process PID: {be_process.pid}")
-        
-        # Start background thread for periodic updates
-        be_update_thread = threading.Thread(
-            target=collect_and_write_be_threads,
-            args=(map_fd, be_process.pid, BE_type, be_update_stop, debug_mode),
-            daemon=True
-        )
-        be_update_thread.start()
-        if debug_mode:
-            print("[DEBUG MODE] Periodic BE thread monitoring started (every 1 seconds)")
-        else:
-            print("Periodic BE thread update started (every 1 seconds)")
 
     # Start LC
     print("Starting LC process...")
@@ -569,7 +543,36 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
                         print(f"  Warning: Ring buffer full, could not write TID {tid} -> LC")
                 except Exception as e:
                     print(f"  Error writing TID {tid} -> LC: {e}")
+    except Exception as e:
+        print(f"Error running LC process: {e}")
         
+   # Start periodic BE thread updates if map_fd is available or in debug mode
+    be_update_thread = None
+    be_update_stop = threading.Event()
+    
+    if map_fd is not None or debug_mode:
+        # Wait for processes to start
+        time.sleep(1.5)
+        
+        if debug_mode:
+            print(f"\n[DEBUG MODE] Starting periodic BE thread monitoring...")
+        else:
+            print(f"\nStarting periodic BE task type updates...")
+        print(f"BE process PID: {be_process.pid}")
+        
+        # Start background thread for periodic updates
+        be_update_thread = threading.Thread(
+            target=collect_and_write_be_threads,
+            args=(map_fd, be_process.pid, BE_type, be_update_stop, debug_mode),
+            daemon=True
+        )
+        be_update_thread.start()
+        if debug_mode:
+            print("[DEBUG MODE] Periodic BE thread monitoring started (every 1 seconds)")
+        else:
+            print("Periodic BE thread update started (every 1 seconds)")
+
+    try:
         # Wait for LC process
         if lc_process:
             try:
