@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Media Streaming Benchmark Script - Modified Launch Pattern
-Uses fixed CPU pinning and auto-scaled video count (100 * rate)
+Media Streaming Benchmark Script - Simplified Launch Pattern
+Runs dataset and server once, then runs client with different parameters each time
 """
 
 import subprocess
@@ -11,7 +11,7 @@ import csv
 import os
 import sys
 import argparse
-import threading
+import shutil
 from datetime import datetime
 from pathlib import Path
 import signal
@@ -20,10 +20,9 @@ class MediaStreamingBenchmark:
     def __init__(self, config):
         self.config = config
         self.results = []
-        self.current_client_process = None
+        self.setup_completed = False
         
-        # Create output directories
-        Path(config['output_dir']).mkdir(parents=True, exist_ok=True)
+        # Create session_lists directory
         Path(config['session_lists_dir']).mkdir(parents=True, exist_ok=True)
         
     def run_command(self, cmd, check=True, capture_output=True, wait=True):
@@ -37,7 +36,6 @@ class MediaStreamingBenchmark:
                 if wait:
                     subprocess.run(cmd, shell=True, check=check)
                 else:
-                    # For non-blocking commands, use Popen
                     process = subprocess.Popen(cmd, shell=True)
                     if wait:
                         process.wait()
@@ -50,159 +48,150 @@ class MediaStreamingBenchmark:
                 raise
             return None, None
 
-    def setup_dataset_and_server(self):
-        """Setup the dataset container and server in correct order"""
-        print("Step 1: Setting up dataset container (this will block until dataset is generated)...")
-        # Clean up existing dataset container
-        self.run_command("docker stop streaming_dataset 2>/dev/null || true", check=False)
-        self.run_command("docker rm streaming_dataset 2>/dev/null || true", check=False)
+    def setup_dataset_and_server_once(self):
+        """Setup dataset and server only once (blocking)"""
+        if self.setup_completed:
+            print("Setup already completed, skipping...")
+            return
+            
+        print("="*80)
+        print("SETUP PHASE (One-time, blocking operations)")
+        print("="*80)
         
-        # Step 1: Run dataset container (this blocks until dataset generation is complete)
+        # Step 1: Run dataset container (blocking)
+        print("\nStep 1: Running dataset container (this will block until complete)...")
+        self.run_command("docker rm -f streaming_dataset 2>/dev/null || true", check=False)
         cmd = "docker run --name streaming_dataset cloudsuite/media-streaming:dataset"
         print(f"Running: {cmd}")
-        print("Waiting for dataset generation to complete... This may take a while.")
         self.run_command(cmd)
-        print("Dataset generation completed!")
+        print("✓ Dataset generation completed")
         
-        # Step 2: Start the server with CPU pinning and file descriptor limits
-        print("\nStep 2: Starting media streaming server with CPU pinning...")
-        # Stop existing server if running
-        self.run_command("docker stop streaming_server 2>/dev/null || true", check=False)
-        self.run_command("docker rm streaming_server 2>/dev/null || true", check=False)
-        
+        # Step 2: Start the server with CPU pinning
+        print("\nStep 2: Starting media streaming server...")
+        self.run_command("docker rm -f streaming_server 2>/dev/null || true", check=False)
         cpuset_cpus = self.config['cpuset_cpus']
         cmd = (
             f"docker run --cpuset-cpus={cpuset_cpus} "
-            f"--ulimit nofile=65536:65536 "  # File descriptor limit
             f"-d --name streaming_server --volumes-from streaming_dataset --net host "
-            f"cloudsuite/media-streaming:server"
+            f"cloudsuite/media-streaming:server 20"  # 20 Nginx workers
         )
         print(f"Running: {cmd}")
         self.run_command(cmd)
+        print("✓ Server started")
         
         # Step 3: Copy session lists
         print("\nStep 3: Copying session lists...")
+        # Clean session_lists directory
+        shutil.rmtree(self.config['session_lists_dir'], ignore_errors=True)
+        Path(self.config['session_lists_dir']).mkdir(parents=True, exist_ok=True)
+        
         cmd = f"docker cp streaming_dataset:/videos/logs/. {self.config['session_lists_dir']}/"
         print(f"Running: {cmd}")
         self.run_command(cmd)
+        print("✓ Session lists copied")
         
         # Wait for server to start
-        print("Waiting for server to start...")
+        print("Waiting for server to be ready...")
         time.sleep(10)
+        
+        self.setup_completed = True
+        print("\n✓ Setup completed successfully!")
 
-    def run_benchmark_phase(self, rate, phase_name):
-        """Run a single benchmark phase with auto-scaled video count (100 * rate)"""
-        print(f"\n=== Running benchmark phase: {phase_name} ===")
-        print(f"Rate: {rate} videos/sec")
-        print(f"Video count: {100 * rate} (auto-scaled as 100 * rate)")
+    def run_single_client_test(self, video_num, rate, test_name):
+        """Run a single client test with given parameters"""
+        print(f"\n" + "="*80)
+        print(f"CLIENT TEST: {test_name}")
+        print(f"Parameters: VideoNum={video_num}, Rate={rate}")
+        print("="*80)
         
-        # Auto-scale video count: 100 * rate
-        video_count = int(100 * rate)
+        # Clean results directory
+        results_dir = self.config['results_dir']
+        shutil.rmtree(results_dir, ignore_errors=True)
+        Path(results_dir).mkdir(parents=True, exist_ok=True)
         
-        # Prepare client command with CPU pinning and file descriptor limits
+        # Build client command
         cpuset_cpus = self.config['cpuset_cpus']
         client_cmd = (
             f"docker run --rm --cpuset-cpus={cpuset_cpus} "
-            f"--ulimit nofile=65536:65536 "  # File descriptor limit
             f"-t -v {self.config['session_lists_dir']}:/videos/logs "
-            f"-v {self.config['output_dir']}:/output --net host "
+            f"-v {results_dir}:/output --net host "
             f"cloudsuite/media-streaming:client localhost "
-            f"{self.config['videoperf_processes']} {video_count} {rate} PT"  # Ensure PT mode
+            f"{self.config['videoperf_processes']} {video_num} {rate}"
         )
         
-        # Start client process
-        print(f"Starting client: {client_cmd}")
-        process = subprocess.Popen(client_cmd, shell=True, stdout=subprocess.PIPE, 
-                                stderr=subprocess.PIPE, text=True, bufsize=1)
-        self.current_client_process = process
+        print(f"Running client: {client_cmd}")
         
-        # Collect metrics from 30s to 90s
-        metrics = self.collect_metrics_30s_to_90s(process, rate, phase_name)
-        
-        # Stop the client process after 90 seconds
-        print(f"Stopping client after 90 seconds...")
-        self.stop_client_process(phase_name)
-        
-        return metrics
-
-    def collect_metrics_30s_to_90s(self, process, rate, phase_name):
-        """Collect metrics specifically from 30s to 90s after start"""
+        # Start client process and capture output
         start_time = time.time()
-        collection_start_time = start_time + 30  # Start collecting at 30s
-        collection_end_time = start_time + 90    # Stop collecting at 90s
+        process = subprocess.Popen(client_cmd, shell=True, stdout=subprocess.PIPE, 
+                                 stderr=subprocess.PIPE, text=True, bufsize=1)
         
+        # Collect output in real-time
         throughput_samples = []
         error_samples = []
-        concurrent_clients_samples = []
+        client_samples = []
         reply_rate_samples = []
+        all_output = []
         
-        print("Waiting for 30 seconds before starting metric collection...")
-        
-        # Phase 1: Wait until 30 seconds (warm-up period)
-        while time.time() < collection_start_time:
-            # line = process.stdout.readline()
-            # if line:
-            #     print(f"Warm-up: {line.strip()}")
-            time.sleep(0.1)
-        
-        print("Starting metric collection (30s - 90s)...")
-        
-        # Phase 2: Collect metrics from 30s to 90s
-        while time.time() < collection_end_time:
-            line = process.stdout.readline()
-            if line:
-                metrics = self.parse_metrics_line(line)
-                if metrics:
-                    throughput_samples.append(metrics['throughput'])
-                    error_samples.append(metrics['total_errors'])
-                    concurrent_clients_samples.append(metrics['concurrent_clients'])
-                    reply_rate_samples.append(metrics['reply_rate'])
+        print("\n--- Client Output ---")
+        try:
+            while True:
+                # Read stdout line
+                stdout_line = process.stdout.readline()
+                if stdout_line:
+                    print(stdout_line.strip())
+                    all_output.append(stdout_line)
                     
-                    print(f"Phase {phase_name} - {metrics}")
-            
-            time.sleep(0.1)
+                    # Parse metrics if available
+                    metrics = self.parse_metrics_line(stdout_line)
+                    if metrics:
+                        throughput_samples.append(metrics['throughput'])
+                        error_samples.append(metrics['total_errors'])
+                        client_samples.append(metrics['concurrent_clients'])
+                        reply_rate_samples.append(metrics['reply_rate'])
+                
+                # Check if process has finished
+                if process.poll() is not None:
+                    # Read any remaining output
+                    remaining_stdout, stderr = process.communicate()
+                    if remaining_stdout:
+                        print(remaining_stdout.strip())
+                        all_output.append(remaining_stdout)
+                    if stderr:
+                        print(f"STDERR: {stderr.strip()}")
+                    break
+                    
+                time.sleep(0.1)
+                
+        except KeyboardInterrupt:
+            print("\nClient test interrupted by user")
+            process.terminate()
+            process.wait()
         
-        # Calculate statistics from the 60-second collection window
-        if throughput_samples:
-            stats = {
-                'phase': phase_name,
-                'rate': rate,
-                'video_count': int(100 * rate),  # Track the auto-scaled video count
-                'collection_window': '30s-90s',
-                'throughput_avg': sum(throughput_samples) / len(throughput_samples),
-                'throughput_p99': self.percentile(throughput_samples, 99),
-                'throughput_p95': self.percentile(throughput_samples, 95),
-                'throughput_max': max(throughput_samples),
-                'throughput_min': min(throughput_samples),
-                'sample_count': len(throughput_samples),
-                'total_errors_avg': sum(error_samples) / len(error_samples),
-                'concurrent_clients_avg': sum(concurrent_clients_samples) / len(concurrent_clients_samples),
-                'reply_rate_avg': sum(reply_rate_samples) / len(reply_rate_samples),
-                'timestamp': datetime.now().isoformat()
-            }
-        else:
-            stats = {
-                'phase': phase_name,
-                'rate': rate,
-                'video_count': int(100 * rate),
-                'collection_window': '30s-90s',
-                'error': 'No metrics collected in 30s-90s window'
-            }
+        # Calculate statistics
+        execution_time = time.time() - start_time
         
-        print(f"Collected {len(throughput_samples)} samples during 30s-90s window")
-        return stats
-
-    def stop_client_process(self, phase_name):
-        """Stop the client process"""
-        if self.current_client_process:
-            # Terminate the process
-            self.current_client_process.terminate()
-            try:
-                self.current_client_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.current_client_process.kill()
-            
-            self.current_client_process = None
+        stats = {
+            'test_name': test_name,
+            'video_num': video_num,
+            'rate': rate,
+            'execution_time_seconds': round(execution_time, 2),
+            'sample_count': len(throughput_samples),
+            'throughput_avg': sum(throughput_samples) / len(throughput_samples) if throughput_samples else 0,
+            'throughput_max': max(throughput_samples) if throughput_samples else 0,
+            'throughput_min': min(throughput_samples) if throughput_samples else 0,
+            'total_errors_avg': sum(error_samples) / len(error_samples) if error_samples else 0,
+            'total_errors_max': max(error_samples) if error_samples else 0,
+            'concurrent_clients_avg': sum(client_samples) / len(client_samples) if client_samples else 0,
+            'reply_rate_avg': sum(reply_rate_samples) / len(reply_rate_samples) if reply_rate_samples else 0,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        # Clean results directory after command finishes
+        print("\nCleaning results directory...")
+        shutil.rmtree(results_dir, ignore_errors=True)
+        
+        return stats, all_output
 
     def parse_metrics_line(self, line):
         """Parse the metrics output line from videoperf"""
@@ -225,75 +214,21 @@ class MediaStreamingBenchmark:
                 'reply_rate': reply_rate
             }
         except (ValueError, IndexError) as e:
-            print(f"Error parsing metrics line: {line}, Error: {e}")
             return None
 
-    def percentile(self, data, percentile):
-        """Calculate percentile from data list"""
-        if not data:
-            return 0
-        sorted_data = sorted(data)
-        index = (len(sorted_data) - 1) * percentile / 100
-        lower_index = int(index)
-        upper_index = lower_index + 1
-        
-        if upper_index >= len(sorted_data):
-            return sorted_data[lower_index]
-        
-        weight = index - lower_index
-        return sorted_data[lower_index] * (1 - weight) + sorted_data[upper_index] * weight
-
-    def run_gradual_load_test(self):
-        """Run the gradual load test with increasing rates and auto-scaled video counts"""
-        print("Starting gradual load test (30s-90s collection window)...")
-        print("Video count will be auto-scaled as 100 * rate")
-        
-        rates = self.generate_rates()
-        
-        for i, rate in enumerate(rates):
-            phase_name = f"phase_{i+1}_rate_{rate}"
-            
-            try:
-                metrics = self.run_benchmark_phase(rate, phase_name)
-                self.results.append(metrics)
-                
-                # Save intermediate results
-                self.save_results()
-                
-                # Check if we should stop (too many errors)
-                if metrics.get('total_errors_avg', 0) > self.config['max_errors']:
-                    print(f"Stopping test due to high error count: {metrics['total_errors_avg']}")
-                    break
-                    
-                # Wait between phases
-                print(f"Cooling down for {self.config['cooldown_duration']} seconds...")
-                time.sleep(self.config['cooldown_duration'])
-                
-            except Exception as e:
-                print(f"Error in phase {phase_name}: {e}")
-                # Continue with next phase
-                continue
-
-    def generate_rates(self):
-        """Generate rate progression for the test"""
-        rates = []
-        current_rate = self.config['initial_rate']
-        
-        while current_rate <= self.config['max_rate']:
-            rates.append(current_rate)
-            current_rate *= self.config['rate_multiplier']
-            
-        return [int(rate) for rate in rates]  # Ensure integer rates
-
-    def save_results(self):
+    def save_results(self, output_dir):
         """Save results to JSON and CSV files"""
+        if not self.results:
+            print("No results to save")
+            return
+            
         # Save as JSON
-        json_file = os.path.join(self.config['output_dir'], 'benchmark_results_30s_90s.json')
+        json_file = os.path.join(output_dir, 'benchmark_results.json')
         with open(json_file, 'w') as f:
             json.dump(self.results, f, indent=2)
         
         # Save as CSV
-        csv_file = os.path.join(self.config['output_dir'], 'benchmark_results_30s_90s.csv')
+        csv_file = os.path.join(output_dir, 'benchmark_results.csv')
         if self.results:
             with open(csv_file, 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=self.results[0].keys())
@@ -303,14 +238,44 @@ class MediaStreamingBenchmark:
         
         print(f"Results saved to {json_file} and {csv_file}")
 
+    def run_parameter_sweep(self, test_cases):
+        """Run multiple test cases with different parameters"""
+        print("\n" + "="*80)
+        print("PARAMETER SWEEP TESTING")
+        print("="*80)
+        
+        for i, test_case in enumerate(test_cases):
+            video_num = test_case['video_num']
+            rate = test_case['rate']
+            test_name = test_case.get('name', f'test_{i+1}')
+            
+            print(f"\n\nTest {i+1}/{len(test_cases)}: {test_name}")
+            
+            stats, output = self.run_single_client_test(video_num, rate, test_name)
+            self.results.append(stats)
+            
+            # Save output to file
+            output_dir = self.config['output_dir']
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            output_file = os.path.join(output_dir, f'{test_name}_output.txt')
+            with open(output_file, 'w') as f:
+                f.writelines(output)
+            
+            # Print summary
+            print(f"\n✓ Test {test_name} completed")
+            print(f"  Throughput avg: {stats['throughput_avg']:.2f} Mbps")
+            print(f"  Errors avg: {stats['total_errors_avg']:.2f}")
+            print(f"  Execution time: {stats['execution_time_seconds']:.2f}s")
+            
+            # Wait between tests
+            if i < len(test_cases) - 1:
+                wait_time = self.config.get('cooldown_duration', 10)
+                print(f"\nWaiting {wait_time} seconds before next test...")
+                time.sleep(wait_time)
+
     def cleanup(self):
         """Clean up Docker containers"""
-        print("Cleaning up containers...")
-        
-        # Stop any running client process
-        if self.current_client_process:
-            self.current_client_process.terminate()
-            self.current_client_process = None
+        print("\nCleaning up containers...")
         
         commands = [
             "docker stop streaming_server 2>/dev/null || true",
@@ -322,23 +287,21 @@ class MediaStreamingBenchmark:
         for cmd in commands:
             self.run_command(cmd, check=False)
 
-    def analyze_results(self):
-        """Analyze and print benchmark results"""
-        print("\n" + "="*60)
-        print("BENCHMARK RESULTS ANALYSIS (30s-90s Collection Window)")
-        print("="*60)
-        print("Video count auto-scaled as 100 * rate")
+    def print_summary(self):
+        """Print summary of all tests"""
+        print("\n" + "="*80)
+        print("BENCHMARK SUMMARY")
+        print("="*80)
         
         for result in self.results:
-            print(f"\nPhase: {result['phase']}")
-            print(f"  Rate: {result['rate']} videos/sec")
-            print(f"  Video Count: {result.get('video_count', 'N/A')}")
-            print(f"  Throughput - P99: {result.get('throughput_p99', 0):.2f} Mbps")
-            print(f"  Throughput - Avg: {result.get('throughput_avg', 0):.2f} Mbps")
-            print(f"  Sample Count: {result.get('sample_count', 0)}")
-            print(f"  Concurrent Clients - Avg: {result.get('concurrent_clients_avg', 0):.1f}")
-            print(f"  Reply Rate - Avg: {result.get('reply_rate_avg', 0):.1f} req/sec")
-            print(f"  Total Errors - Avg: {result.get('total_errors_avg', 0):.1f}")
+            print(f"\nTest: {result['test_name']}")
+            print(f"  Parameters: VideoNum={result['video_num']}, Rate={result['rate']}")
+            print(f"  Throughput: {result['throughput_avg']:.2f} Mbps (avg)")
+            print(f"  Max Throughput: {result['throughput_max']:.2f} Mbps")
+            print(f"  Errors: {result['total_errors_avg']:.2f} (avg)")
+            print(f"  Concurrent Clients: {result['concurrent_clients_avg']:.1f} (avg)")
+            print(f"  Reply Rate: {result['reply_rate_avg']:.1f} req/sec (avg)")
+            print(f"  Execution Time: {result['execution_time_seconds']}s")
 
 def signal_handler(sig, frame):
     """Handle Ctrl+C gracefully"""
@@ -348,56 +311,68 @@ def signal_handler(sig, frame):
 def main():
     signal.signal(signal.SIGINT, signal_handler)
     
-    parser = argparse.ArgumentParser(description='Media Streaming Benchmark - Modified Launch Pattern')
-    parser.add_argument('--output-dir', default='./benchmark_results_30s_90s', help='Output directory for results')
-    parser.add_argument('--max-rate', type=int, default=3000, help='Maximum request rate to test')
-    parser.add_argument('--initial-rate', type=int, default=10, help='Initial request rate')
-    parser.add_argument('--rate-multiplier', type=float, default=10, help='Multiplier for rate increase')
+    parser = argparse.ArgumentParser(description='Media Streaming Benchmark - Simple Client Tests')
+    parser.add_argument('--output-dir', default='./benchmark_output', 
+                       help='Output directory for results')
+    parser.add_argument('--session-lists-dir', default='./session_lists',
+                       help='Directory for session lists')
+    parser.add_argument('--results-dir', default='./results',
+                       help='Temporary results directory (cleaned after each test)')
     parser.add_argument('--cpuset-cpus', default='0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32,34,36,38', 
                        help='CPU cores to pin for server and client')
     
+    # Test case parameters
+    parser.add_argument('--test-cases', type=str, default='100:5,200:10,500:20,1000:50',
+                       help='Test cases in format "video_num1:rate1,video_num2:rate2,..."')
+    parser.add_argument('--cooldown-duration', type=int, default=10,
+                       help='Seconds to wait between tests')
+    
     args = parser.parse_args()
+    
+    # Parse test cases
+    test_cases = []
+    if args.test_cases:
+        for i, test_str in enumerate(args.test_cases.split(',')):
+            if ':' in test_str:
+                video_num_str, rate_str = test_str.split(':')
+                test_cases.append({
+                    'name': f'test_{i+1}',
+                    'video_num': int(video_num_str),
+                    'rate': int(rate_str)
+                })
+    
+    # Default test cases if none provided
+    if not test_cases:
+        test_cases = [
+            {'name': 'low_load', 'video_num': 100, 'rate': 5},
+            {'name': 'medium_load', 'video_num': 500, 'rate': 20},
+            {'name': 'high_load', 'video_num': 1000, 'rate': 50},
+        ]
     
     # Configuration
     config = {
         'output_dir': args.output_dir,
-        'session_lists_dir': './session_lists',
-        
-        # CPU pinning configuration
+        'session_lists_dir': args.session_lists_dir,
+        'results_dir': args.results_dir,
         'cpuset_cpus': args.cpuset_cpus,
-        
-        # Benchmark parameters
         'videoperf_processes': 20,
-        'encryption_mode': 'PT',  # Plain text
-        
-        # Load test parameters
-        'initial_rate': args.initial_rate,
-        'max_rate': args.max_rate,
-        'rate_multiplier': args.rate_multiplier,
-        'cooldown_duration': 15,  # seconds between phases
-        'max_errors': 10
+        'cooldown_duration': args.cooldown_duration,
     }
     
     benchmark = MediaStreamingBenchmark(config)
     
     try:
-        # Setup following your exact steps
-        print("The launch pattern:")
-        print("1. docker run --name streaming_dataset cloudsuite/media-streaming:dataset")
-        print("2. docker run --cpuset-cpus=<cpus> -d --name streaming_server --volumes-from streaming_dataset --net host cloudsuite/media-streaming:server")
-        print("3. docker cp streaming_dataset:/videos/logs/. ./session_lists/")
-        print("4. docker run --rm --cpuset-cpus=<cpus> -t -v session_lists:/videos/logs -v results:/output --net host cloudsuite/media-streaming:client localhost 20 <video_count> <rate> PT")
-        print("   where video_count = 100 * rate")
-        print("="*80)
+        # One-time setup
+        benchmark.setup_dataset_and_server_once()
         
-        # Combined setup that handles the blocking dataset generation properly
-        benchmark.setup_dataset_and_server()  # Steps 1, 2, 3 in correct order
+        # Run parameter sweep
+        benchmark.run_parameter_sweep(test_cases)
         
-        # Run benchmark (Step 4 with auto-scaled video count)
-        benchmark.run_gradual_load_test()
+        # Save results
+        benchmark.save_results(args.output_dir)
         
-        # Analyze results
-        benchmark.analyze_results()
+        # Print summary
+        benchmark.print_summary()
         
     except KeyboardInterrupt:
         print("\nBenchmark interrupted by user")
