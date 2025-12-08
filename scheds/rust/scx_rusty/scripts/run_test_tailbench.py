@@ -8,7 +8,9 @@ import ctypes.util
 import struct
 import threading
 from datetime import datetime
+from pathlib import Path
 
+TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
 SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "470.lbm", "473.astar", "483.xalancbmk"]
 First_SMT_silibing_core_ID = 20 # Hard coded
 Num_total_cores = 40 # with SMT counted
@@ -349,21 +351,10 @@ def collect_and_write_be_threads(map_fd, be_process_pid, BE_type, stop_event, de
 def kill_all_spec_processes():
     """Kill all runspec and benchmark processes"""
     commands = [
-        "pkill -f runspec",
-        "pkill -f specinvoke", 
-        "pkill -f specmake",
-        "pkill -f '400\.'",  # perlbench
-        "pkill -f '401\.'",  # bzip2
-        "pkill -f '403\.'",  # gcc
-        "pkill -f '429\.'",  # mcf
-        "pkill -f '445\.'",  # gobmk
-        "pkill -f '456\.'",  # hmmer
-        "pkill -f '458\.'",  # sjeng
-        "pkill -f '462\.'",  # libquantum
-        "pkill -f '464\.'",  # h264ref
-        "pkill -f '471\.'",  # omnetpp
-        "pkill -f '473\.'",  # astar
-        "pkill -f '483\.'",  # xalancbmk
+        "sudo pkill -f runspec",
+        "sudo pkill -f specinvoke", 
+        "sudo pkill -f specmake",
+        "sudo pkill -f run_base"
     ]
     
     for cmd in commands:
@@ -380,9 +371,9 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
 
     # Masstree configuration
     if LC_type == "masstree":
-        masstree_dir = os.path.expanduser("/home/dell-07/wltu/Tailbench/tailbench/masstree")
-        QPS = 5000
-        MAXREQS = QPS * 120
+        masstree_dir = TailbenchDir / "masstree"
+        QPS = 6410
+        MAXREQS = QPS * 60
         WARMUPREQS = QPS
         MINSLEEPNS = 100
         NTHREADS = os.environ.get("NTHREADS", "20")
@@ -609,9 +600,39 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
     except (ProcessLookupError, AttributeError) as e:
         print(f"Error checking BE process status: {e}")
     
+    print("Extract latency from the log file...")
+    # Parse results
+    lats_bin = TailbenchDir / "masstree" / "lats.bin"
+    results_file = f"{LC_type}/{BE_type}/latency.log"
+    
+    if not lats_bin.exists():
+        print(f"WARNING: {lats_bin} not found after benchmark run")
+        exit(1)
+    
+    print(f"\nParsing latency results...")
+    parse_cmd = [
+        "python3",
+        str(TailbenchDir / "utilities" / "parselats.py"),
+        str(lats_bin)
+    ]
+    
+    try:
+        with open(results_file, 'w') as f:
+            parse_result = subprocess.run(
+                parse_cmd,
+                stdout=f,
+                stderr=subprocess.PIPE,
+                check=True,
+                text=True
+            )
+        print(f"Results saved to: {results_file}")
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: Failed to parse results")
+        print(f"Error: {e.stderr}")
+
     # Kill SPEC processes
     kill_all_spec_processes()
-    
+
     print("Execution completed")
 
 if __name__ == "__main__":
