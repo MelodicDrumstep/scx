@@ -6,6 +6,7 @@
 use anyhow::{anyhow, Context, Result};
 use libbpf_rs::MapCore;
 use libbpf_rs::MapFlags;
+use std::process::Command;
 
 use crate::bpf_intf;
 use crate::BpfSkel;
@@ -195,6 +196,9 @@ pub fn process_task_type_ring_buffer(skel: &mut BpfSkel) -> Result<usize> {
             ring_bytes[entry_offset + 3],
         ]);
         let task_type_val = ring_bytes[entry_offset + 4];
+
+        // /* DEBUGING */
+        // println!("Processing entry: PID={}, Task Type={}", pid, task_type_val);
 
         // Update the task_type_by_pid map
         if task_type_val == TASK_TYPE_LC || task_type_val == TASK_TYPE_BE {

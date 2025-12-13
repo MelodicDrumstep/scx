@@ -73,6 +73,7 @@ enum consts {
 };
 
 enum task_type {
+	TASK_TYPE_UNINITIALIZED = -1,
 	TASK_TYPE_LC = 0,
 	TASK_TYPE_BE = 1,
 };

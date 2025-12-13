@@ -402,15 +402,15 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
     # SPEC CPU environment - need to cd to directory and source shrc to set up Perl environment
     spec_dir = os.path.expanduser("/home/dell-07/wltu/speccpu2006-v1.0.1")
     
-    # if num_cores:
-    #     # cd to spec directory, source shrc (sets up Perl @INC), then run runspec
-    #     BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && taskset -c {First_SMT_silibing_core_ID}-{First_SMT_silibing_core_ID + num_cores - 1} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {num_cores} {BE_type}'"
-    # elif NUMA_unaware:
-    #     BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && taskset 0x1111111111 runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 2)} {BE_type}'"
-    # else:
-    #     BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores)} {BE_type}'"
-    # # DEBUGING
-    BE_cmd = "sleep 10000"
+    if num_cores:
+        # cd to spec directory, source shrc (sets up Perl @INC), then run runspec
+        BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && taskset -c {First_SMT_silibing_core_ID}-{First_SMT_silibing_core_ID + num_cores - 1} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {num_cores} {BE_type}'"
+    elif NUMA_unaware:
+        BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && taskset 0x1111111111 runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 2)} {BE_type}'"
+    else:
+        BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores)} {BE_type}'"
+    # DEBUGING
+    # BE_cmd = "sleep 10000"
 
     print(f"LC_cmd : {LC_cmd}, BE_cmd : {BE_cmd}")
 
@@ -468,7 +468,16 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
         print(f"LC process PID: {lc_process.pid}")
     except Exception as e:
         print(f"Error running LC process: {e}")
-        
+
+    # Collect LC tid and write to the ring buffer
+    # Use grep 
+    lc_tid = get_all_thread_ids(lc_process.pid)
+    if map_fd is not None:
+        for tid in lc_tid:
+            write_task_type_update(map_fd, tid, TASK_TYPE_LC)
+        print(f"Written LC TID: {lc_tid} to the ring buffer")
+        print(f"LC TID: {lc_tid}")
+
    # Start periodic BE thread updates if map_fd is available or in debug mode
     be_update_thread = None
     be_update_stop = threading.Event()
@@ -529,12 +538,12 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
             pass
     
     # # Stop periodic updates
-    # if be_update_thread is not None:
-    #     print("Stopping periodic BE thread updates...")
-    #     be_update_stop.set()
-    #     be_update_thread.join(timeout=2.0)
-    #     if be_update_thread.is_alive():
-    #         print("Warning: BE update thread did not stop gracefully")
+    if be_update_thread is not None:
+        print("Stopping periodic BE thread updates...")
+        be_update_stop.set()
+        be_update_thread.join(timeout=2.0)
+        if be_update_thread.is_alive():
+            print("Warning: BE update thread did not stop gracefully")
     
     # Check if BE process is still running and terminate it
     try:

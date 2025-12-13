@@ -9,7 +9,7 @@ use libbpf_sys;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::io::RawFd;
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,28 +110,27 @@ fn open_map_fd_by_path(path: &str) -> Result<RawFd> {
 
 /// Test client for LC/BE task type support
 ///
-/// This client launches LC and BE programs and writes their PID -> task type
-/// mappings into the ring buffer for the scheduler to consume.
+/// This client launches one LC parent thread and one BE parent thread.
+/// Each parent thread spawns child threads periodically, and we write
+/// the parent thread PID (tgid) -> task type mappings into the ring buffer.
+/// Child threads inherit the type from their parent's tgid.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Path to the shared memory file (for compatibility, not used for ring buffer)
     #[clap(long)]
     task_type_shm: String,
 
-    /// Number of LC (Latency Critical) tasks to launch
-    #[clap(long, default_value = "0")]
-    num_lc: usize,
+    /// Number of LC threads to spawn every 10s
+    #[clap(long, default_value = "1")]
+    num_lc_threads: usize,
 
-    /// Number of BE (Best Effort) tasks to launch
-    #[clap(long, default_value = "0")]
-    num_be: usize,
+    /// Number of BE threads to spawn every 10s
+    #[clap(long, default_value = "1")]
+    num_be_threads: usize,
 }
 
-struct TaskInfo {
-    child: Child,
-    pid: u32,
-    task_type: u8,
-}
+/// CPU cores to pin threads to: 0, 4, 8, 12, 16, 20, 24, 28, 32, 36
+const CORES: [usize; 10] = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36];
 
 /// Write a task type update to the ring buffer
 fn write_task_type_update(
@@ -233,51 +232,134 @@ fn write_task_type_update(
     Ok(true)
 }
 
-/// Launch a simple busy loop program pinned to specific CPUs
-/// CPUs used: 0, 4, 8, 12, 16, 20, 24, 28, 32, 36 (10 cores total)
-fn launch_busy_loop(task_id: usize, task_type: &str) -> Result<TaskInfo> {
-    // Map task_id to one of the 10 cores: 0, 4, 8, 12, 16, 20, 24, 28, 32, 36
-    const CORES: [usize; 10] = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36];
-    let cpu = CORES[task_id % 10];
+/// Get the current process PID (which is the tgid for the main thread)
+fn get_current_pid() -> u32 {
+    unsafe { libc::getpid() as u32 }
+}
+
+/// Get child process PIDs of a given parent PID
+// And also consider child threads
+fn get_child_pids(parent_pid: u32) -> Result<Vec<u32>> {
+    let mut child_pids = Vec::new();
     
-    // Launch a simple busy loop program pinned to the specific CPU using taskset
-    let child = Command::new("taskset")
-        .arg("-c")
-        .arg(cpu.to_string())
-        .arg("sh")
-        .arg("-c")
-        .arg(format!(
-            "while true; do :; done"
-        ))
-        .spawn()
-        .context("Failed to spawn busy loop process")?;
-
-    let pid = child.id() as u32;
+    // Use pgrep -P to get direct children
+    let output = Command::new("pgrep")
+        .arg("-P")
+        .arg(parent_pid.to_string())
+        .output()
+        .context("Failed to run pgrep")?;
     
-    // Give the process a moment to start
-    thread::sleep(Duration::from_millis(10));
+    if !output.status.success() {
+        // pgrep returns non-zero if no processes found, which is fine
+        return Ok(child_pids);
+    }
+    
+    let output_str = String::from_utf8(output.stdout)
+        .context("Failed to parse pgrep output")?;
+    
+    for pid_str in output_str.lines() {
+        if pid_str.is_empty() {
+            continue;
+        }
+        if let Ok(pid) = pid_str.parse::<u32>() {
+            child_pids.push(pid);
+        }
+    }
 
-    let task_type_val = match task_type {
-        "LC" => TASK_TYPE_LC,
-        "BE" => TASK_TYPE_BE,
-        _ => return Err(anyhow!("Invalid task type: {}", task_type)),
-    };
+    // Get child threads, using ps -T -p <parent_pid>
+    let threads = Command::new("ps")
+        .arg("-T")
+        .arg("-p")
+        .arg(parent_pid.to_string())
+        .output()
+        .context("Failed to run ps")?;
+    let threads_str = String::from_utf8(threads.stdout)
+        .context("Failed to parse ps output")?;
+    
+    for line in threads_str.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parts = line.split_whitespace().collect::<Vec<&str>>();
+        if parts.len() != 2 {
+            continue;
+        }
+        if let Ok(thread_pid) = parts[0].parse::<u32>() {
+            child_pids.push(thread_pid);
+        }
+    }
 
-    println!("Launched {} task #{} with PID {} on CPU {}", task_type, task_id, pid, cpu);
+    Ok(child_pids)
+}
 
-    Ok(TaskInfo {
-        child,
-        pid,
-        task_type: task_type_val,
-    })
+/// Recursively write all child processes of a parent to the ring buffer
+fn recursively_write_children_to_ring_buffer(
+    map_fd: RawFd,
+    parent_pid: u32,
+    task_type: u8,
+    max_depth: usize,
+    current_depth: usize,
+) -> Result<usize> {
+    if current_depth >= max_depth {
+        return Ok(0);
+    }
+    
+    let child_pids = get_child_pids(parent_pid)?;
+    let mut written_count = 0;
+    
+    for child_pid in child_pids {
+        // DEBUGING
+        println!("  DEBUG: Writing child PID {} -> {} (depth {})", 
+                 child_pid,
+                 if task_type == TASK_TYPE_LC { "LC" } else { "BE" },
+                 current_depth + 1);
+
+        // Write this child PID to the ring buffer
+        match write_task_type_update(map_fd, child_pid, task_type) {
+            Ok(true) => {
+                written_count += 1;
+                if current_depth == 0 {
+                    println!("  Written: Child PID {} -> {} (depth {})", 
+                             child_pid,
+                             if task_type == TASK_TYPE_LC { "LC" } else { "BE" },
+                             current_depth + 1);
+                }
+            }
+            Ok(false) => {
+                eprintln!("  Warning: Ring buffer full, could not write child PID {} -> {}", 
+                          child_pid, 
+                          if task_type == TASK_TYPE_LC { "LC" } else { "BE" });
+            }
+            Err(e) => {
+                eprintln!("  Error writing child PID {} -> {}: {}", 
+                          child_pid,
+                          if task_type == TASK_TYPE_LC { "LC" } else { "BE" },
+                          e);
+            }
+        }
+        
+        // Recursively write grandchildren
+        let grandchildren_written = recursively_write_children_to_ring_buffer(
+            map_fd,
+            child_pid,
+            task_type,
+            max_depth,
+            current_depth + 1,
+        )?;
+        written_count += grandchildren_written;
+    }
+    
+    Ok(written_count)
 }
 
 fn main() -> Result<()> {
     let opts = Opts::parse();
 
     println!("Test Task Types Client");
-    println!("  LC tasks: {}", opts.num_lc);
-    println!("  BE tasks: {}", opts.num_be);
+    println!("  LC threads per batch: {}", opts.num_lc_threads);
+    println!("  BE threads per batch: {}", opts.num_be_threads);
+    println!("  Spawn interval: 60 seconds");
+    println!("  Thread duration: 50-60 seconds (random)");
     println!("  Task type shm path: {}", opts.task_type_shm);
 
     // Convert the path to BPF filesystem path if needed
@@ -304,78 +386,208 @@ fn main() -> Result<()> {
     // Ensure the FD is closed when we're done
     let _map_guard = MapFdGuard(map_fd);
 
-    // Launch LC tasks
-    let mut lc_tasks = Vec::new();
-    for i in 0..opts.num_lc {
-        let task_info = launch_busy_loop(i, "LC")?;
-        lc_tasks.push(task_info);
-    }
+    // Get the current process PID (this is the tgid for all threads in this process)
+    let main_pid = get_current_pid();
+    println!("\nMain process PID (tgid): {}", main_pid);
 
-    // Launch BE tasks
-    let mut be_tasks = Vec::new();
-    for i in 0..opts.num_be {
-        let task_info = launch_busy_loop(i, "BE")?;
-        be_tasks.push(task_info);
-    }
-
-    // Write all task type mappings to the ring buffer
-    println!("\nWriting task type mappings to ring buffer...");
+    // We need to create separate processes for LC and BE parent threads
+    // because they need different tgids. Let's use a different approach:
+    // Launch two separate processes, each with their own main thread that acts as parent
     
-    for task_info in lc_tasks.iter() {
-        match write_task_type_update(map_fd, task_info.pid, task_info.task_type) {
-            Ok(true) => println!("  Written: PID {} -> LC", task_info.pid),
-            Ok(false) => eprintln!("  Warning: Ring buffer full, could not write PID {} -> LC", task_info.pid),
-            Err(e) => eprintln!("  Error writing PID {} -> LC: {}", task_info.pid, e),
-        }
+    // Launch LC parent process
+    let lc_script = format!(r#"
+        #!/bin/bash
+        # LC parent process - spawns {} LC threads every 0s
+        CORES=(0 4 8 12 16 20 24 28 32 36)
+        COUNTER=0
+        while true; do
+            # Spawn {} child threads
+            for i in $(seq 1 {}); do
+                (
+                    # Random duration 6-10 seconds
+                    DUR=$((6 + RANDOM % 4))
+                    # Pin to one of the 10 cores: 0, 4, 8, 12, 16, 20, 24, 28, 32, 36
+                    CPU_IDX=$(( (COUNTER * {} + i - 1) % 10 ))
+                    case $CPU_IDX in
+                        0) CPU_ID=0 ;;
+                        1) CPU_ID=4 ;;
+                        2) CPU_ID=8 ;;
+                        3) CPU_ID=12 ;;
+                        4) CPU_ID=16 ;;
+                        5) CPU_ID=20 ;;
+                        6) CPU_ID=24 ;;
+                        7) CPU_ID=28 ;;
+                        8) CPU_ID=32 ;;
+                        9) CPU_ID=36 ;;
+                        *) CPU_ID=0 ;;
+                    esac
+                    taskset -c $CPU_ID timeout $DUR sh -c 'j=0; while true; do j=$((j+1)); done' 2>/dev/null || true
+                ) &
+            done
+            COUNTER=$((COUNTER + 1))
+            echo "LC parent spawned {} threads (batch $COUNTER)"
+            sleep 10
+        done
+    "#, opts.num_lc_threads, opts.num_lc_threads, opts.num_lc_threads, opts.num_lc_threads, opts.num_lc_threads);
+    
+    let mut lc_child = Command::new("bash")
+        .arg("-c")
+        .arg(&lc_script)
+        .spawn()
+        .context("Failed to spawn LC parent process")?;
+    let lc_pid = lc_child.id() as u32;
+    thread::sleep(Duration::from_millis(100));
+
+    // Launch BE parent process
+    let be_script = format!(r#"
+        #!/bin/bash
+        # BE parent process - spawns {} BE threads every 10s
+        COUNTER=0
+        CORES=(0 4 8 12 16 20 24 28 32 36)
+        while true; do
+            # Spawn {} child threads
+            for i in $(seq 1 {}); do
+                (
+                    # Random duration 6-10 seconds
+                    DUR=$((6 + RANDOM % 4))
+                    # Pin to one of the 10 cores: 0, 4, 8, 12, 16, 20, 24, 28, 32, 36
+                    CPU_IDX=$(( (COUNTER * {} + i - 1) % 10 ))
+                    case $CPU_IDX in
+                        0) CPU_ID=0 ;;
+                        1) CPU_ID=4 ;;
+                        2) CPU_ID=8 ;;
+                        3) CPU_ID=12 ;;
+                        4) CPU_ID=16 ;;
+                        5) CPU_ID=20 ;;
+                        6) CPU_ID=24 ;;
+                        7) CPU_ID=28 ;;
+                        8) CPU_ID=32 ;;
+                        9) CPU_ID=36 ;;
+                        *) CPU_ID=0 ;;
+                    esac
+                    taskset -c $CPU_ID timeout $DUR sh -c 'j=0; while true; do j=$((j+2)); done' 2>/dev/null || true
+                ) &
+            done
+            COUNTER=$((COUNTER + 1))
+            echo "BE parent spawned {} threads (batch $COUNTER)"
+            sleep 10
+        done
+    "#, opts.num_be_threads, opts.num_be_threads, opts.num_be_threads, opts.num_be_threads, opts.num_be_threads);
+    
+    let mut be_child = Command::new("bash")
+        .arg("-c")
+        .arg(&be_script)
+        .spawn()
+        .context("Failed to spawn BE parent process")?;
+    let be_pid = be_child.id() as u32;
+    thread::sleep(Duration::from_millis(100));
+
+    // Write parent process PIDs (tgid) to the ring buffer
+    println!("\nWriting parent process PIDs (tgid) to ring buffer...");
+    
+    match write_task_type_update(map_fd, lc_pid, TASK_TYPE_LC) {
+        Ok(true) => println!("  Written: LC parent PID (tgid) {} -> LC", lc_pid),
+        Ok(false) => eprintln!("  Warning: Ring buffer full, could not write LC parent PID {} -> LC", lc_pid),
+        Err(e) => eprintln!("  Error writing LC parent PID {} -> LC: {}", lc_pid, e),
     }
 
-    for task_info in be_tasks.iter() {
-        match write_task_type_update(map_fd, task_info.pid, task_info.task_type) {
-            Ok(true) => println!("  Written: PID {} -> BE", task_info.pid),
-            Ok(false) => eprintln!("  Warning: Ring buffer full, could not write PID {} -> BE", task_info.pid),
-            Err(e) => eprintln!("  Error writing PID {} -> BE: {}", task_info.pid, e),
-        }
+    match write_task_type_update(map_fd, be_pid, TASK_TYPE_BE) {
+        Ok(true) => println!("  Written: BE parent PID (tgid) {} -> BE", be_pid),
+        Ok(false) => eprintln!("  Warning: Ring buffer full, could not write BE parent PID {} -> BE", be_pid),
+        Err(e) => eprintln!("  Error writing BE parent PID {} -> BE: {}", be_pid, e),
     }
 
-    println!("\nAll task type mappings written. Tasks are running...");
+    // Now we recursively write the sub processes of the parent processes into the ring buffer
+    println!("\nRecursively writing child processes to ring buffer...");
+    
+    // Wait a bit for processes to spawn
+    thread::sleep(Duration::from_millis(500));
+    
+    // Recursively write LC child processes (max depth 3 to avoid too many processes)
+    let lc_children_written = recursively_write_children_to_ring_buffer(
+        map_fd,
+        lc_pid,
+        TASK_TYPE_LC,
+        3, // max_depth
+        0, // current_depth
+    ).unwrap_or(0);
+    
+    // Recursively write BE child processes (max depth 3)
+    let be_children_written = recursively_write_children_to_ring_buffer(
+        map_fd,
+        be_pid,
+        TASK_TYPE_BE,
+        3, // max_depth
+        0, // current_depth
+    ).unwrap_or(0);
+    
+    println!("  Written {} LC child processes", lc_children_written);
+    println!("  Written {} BE child processes", be_children_written);
+
+    println!("\nParent process PIDs written. Child processes are being tracked recursively.");
+    println!("LC parent (PID {}) spawns {} threads every 60s", lc_pid, opts.num_lc_threads);
+    println!("BE parent (PID {}) spawns {} threads every 60s", be_pid, opts.num_be_threads);
+    println!("Threads run for 50-60 seconds and are pinned to CPUs: {:?}", CORES);
     println!("Press Ctrl+C to stop.");
 
     // Wait for Ctrl+C
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-    ctrlc::set_handler(move || {
-        shutdown_clone.store(true, Ordering::Relaxed);
-    })
-    .context("Error setting Ctrl-C handler")?;
+    
+    // // Set up a periodic task to update child processes (they spawn every 10s)
+    // let map_fd_clone = map_fd;
+    // let lc_pid_clone = lc_pid;
+    // let be_pid_clone = be_pid;
+    // let shutdown_clone = shutdown.clone();
+    
+    // thread::spawn(move || {
+    //     while !shutdown_clone.load(Ordering::Relaxed) {
+    //         thread::sleep(Duration::from_secs(5)); // Check every 5 seconds
+            
+    //         // Periodically update child processes
+    //         let _ = recursively_write_children_to_ring_buffer(
+    //             map_fd_clone,
+    //             lc_pid_clone,
+    //             TASK_TYPE_LC,
+    //             3,
+    //             0,
+    //         );
+    //         let _ = recursively_write_children_to_ring_buffer(
+    //             map_fd_clone,
+    //             be_pid_clone,
+    //             TASK_TYPE_BE,
+    //             3,
+    //             0,
+    //         );
+    //     }
+    // });
+    // let shutdown_clone = shutdown.clone();
+    // ctrlc::set_handler(move || {
+    //     shutdown_clone.store(true, Ordering::Relaxed);
+    // })
+    // .context("Error setting Ctrl-C handler")?;
 
     // Keep running until interrupted
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
         
-        // Check if any processes have died
-        for task_info in lc_tasks.iter_mut() {
-            if let Ok(Some(_)) = task_info.child.try_wait() {
-                println!("LC task with PID {} has exited", task_info.pid);
-            }
+        // Check if parent processes have died
+        if let Ok(Some(_)) = lc_child.try_wait() {
+            println!("LC parent process with PID {} has exited", lc_pid);
+            break;
         }
-        for task_info in be_tasks.iter_mut() {
-            if let Ok(Some(_)) = task_info.child.try_wait() {
-                println!("BE task with PID {} has exited", task_info.pid);
-            }
+        if let Ok(Some(_)) = be_child.try_wait() {
+            println!("BE parent process with PID {} has exited", be_pid);
+            break;
         }
     }
 
     println!("\nShutting down...");
 
-    // Kill all child processes
-    for mut task_info in lc_tasks {
-        let _ = task_info.child.kill();
-        let _ = task_info.child.wait();
-    }
-    for mut task_info in be_tasks {
-        let _ = task_info.child.kill();
-        let _ = task_info.child.wait();
-    }
+    // Kill parent processes (this will also kill their child threads)
+    let _ = lc_child.kill();
+    let _ = lc_child.wait();
+    let _ = be_child.kill();
+    let _ = be_child.wait();
 
     println!("Done.");
     Ok(())

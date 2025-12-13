@@ -213,6 +213,12 @@ struct Opts {
     #[clap(long, default_value = "0")]
     exit_dump_len: u32,
 
+    /// Watchdog timeout in milliseconds. Tasks that fail to run for this duration
+    /// will trigger a scheduler error. Default is 10000ms (10 seconds).
+    /// Set to 0 to disable watchdog (not recommended).
+    #[clap(long, default_value = "10000")]
+    timeout_ms: u32,
+
     /// Enable verbose output, including libbpf details. Specify multiple
     /// times to increase verbosity.
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
@@ -465,6 +471,7 @@ impl<'a> Scheduler<'a> {
             skel.struct_ops.rusty_mut().flags |= *compat::SCX_OPS_SWITCH_PARTIAL;
         }
         skel.struct_ops.rusty_mut().exit_dump_len = opts.exit_dump_len;
+        skel.struct_ops.rusty_mut().timeout_ms = opts.timeout_ms;
 
         rodata.load_half_life = (opts.load_half_life * 1000000000.0) as u32;
         rodata.kthreads_local = opts.kthreads_local;
