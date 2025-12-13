@@ -604,11 +604,38 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 			}
 			return;
 		}
+		else {
+			// check the parent of parent
+			struct task_struct *grandparent;
+			u32 grandparent_tgid;
+
+			grandparent = BPF_CORE_READ(parent, real_parent);
+			if (grandparent) {
+				grandparent_tgid = BPF_CORE_READ(grandparent, tgid);
+				entry = bpf_map_lookup_elem(&task_type_by_pid, &grandparent_tgid);
+				if (entry) {
+					task_type_val = *entry;
+					taskc->task_type = (s8)task_type_val;
+					bpf_map_update_elem(&task_type_by_pid, &parent_tgid, &task_type_val, BPF_ANY);
+					bpf_map_update_elem(&task_type_by_pid, &pid, &task_type_val, BPF_ANY);
+					// DEBUGING
+					bpf_printk("[TASK_TYPE] Inherited task type from grand parent PID=%u for PID=%u (TGID=%u, %s): TYPE=%s",
+							   grandparent_tgid, pid, tgid, p->comm, task_type_val == TASK_TYPE_LC ? "LC" : "BE");
+					return;
+				}
+			}
+		}
 	}
-	if (debug >= 2) {
+	// DEBUGING
+	else {
+		// DEBUGING
 		bpf_printk("[TASK_TYPE] No parent process found for PID=%u (TGID=%u)",
 				   pid, tgid);
 	}
+	
+	// DEBUGING
+	bpf_printk("[TASK_TYPE] No task type found for PID=%u (TGID=%u)",
+			   pid, tgid);
 	taskc->task_type = TASK_TYPE_UNINITIALIZED;
 }
 
@@ -1216,8 +1243,16 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 		return prev_cpu >= 0 && prev_cpu < nr_cpu_ids ? prev_cpu : 0;
 	}
 
+	// DEBUGING
+	int old_task_type = taskc->task_type;
 	/* Update task type before checking (in case it was just added) */
 	assign_task_type(taskc, p);
+
+	if (old_task_type != taskc->task_type) {
+		// DEBUGING
+		bpf_printk("[TASK_TYPE] Task type changed from %d to %d for PID=%u (TGID=%u)",
+				   old_task_type, taskc->task_type, p->pid, p->tgid);
+	}
 
 	/* LC task wakeup logic: find suitable CPU or kick BE to make room */
 	if (taskc->task_type == TASK_TYPE_LC) { /* LC = 0 */
@@ -1475,7 +1510,16 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 		return;
 
 	/* Update task type on every enqueue to catch newly added mappings */
+	// DEBUGING
+	int old_task_type = taskc->task_type;
+	/* Update task type before checking (in case it was just added) */
 	assign_task_type(taskc, p);
+
+	if (old_task_type != taskc->task_type) {
+		// DEBUGING
+		bpf_printk("[TASK_TYPE] Task type changed from %d to %d for PID=%u (TGID=%u)",
+				   old_task_type, taskc->task_type, p->pid, p->tgid);
+	}
 	
 	/* Check if this is a BE task - enqueue to pending DSQ */
 	if (should_delay_be_task(taskc)) {

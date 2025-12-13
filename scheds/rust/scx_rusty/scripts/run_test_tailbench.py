@@ -365,6 +365,59 @@ def kill_all_spec_processes():
     
     print("Killed all SPEC processes")
 
+def collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode=False):
+    # Recursively collect and write BE process PIDs and sub-process PIDs to ring buffer (one-time)
+    if map_fd is not None or debug_mode:
+        # Wait for processes to start
+        time.sleep(1.5)
+        
+        if debug_mode:
+            print(f"\n[DEBUG MODE] Collecting BE process and sub-process PIDs...")
+        else:
+            print(f"\nCollecting BE process and sub-process PIDs...")
+        print(f"BE process PID: {be_process.pid}")
+        
+        # Collect BE PIDs recursively
+        be_pids = []
+        be_pids.append(be_process.pid)
+        
+        # Get process group PIDs
+        pgid_pids = get_process_group_pids(be_process.pid)
+        be_pids.extend(pgid_pids)
+        
+        # Get descendant PIDs recursively
+        descendant_pids = get_descendant_pids(be_process.pid, max_depth=5)
+        be_pids.extend(descendant_pids)
+        
+        # Get all unique BE PIDs
+        unique_be_pids = sorted(set(be_pids))
+        
+        # Get all threads for all BE processes
+        be_threads = get_all_threads_for_processes(unique_be_pids)
+        
+        if debug_mode:
+            # Debug mode: just print thread IDs
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            print(f"[{timestamp}] DEBUG: BE Process PIDs: {unique_be_pids}")
+            print(f"[{timestamp}] DEBUG: BE Thread IDs ({len(be_threads)} total): {sorted(set(be_threads))}")
+        else:
+            # Normal mode: Write BE threads to ring buffer (one-time)
+            written_count = 0
+            failed_count = 0
+            for tid in set(be_threads):
+                try:
+                    if write_task_type_update(map_fd, tid, TASK_TYPE_BE):
+                        written_count += 1
+                    else:
+                        failed_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    print(f"  Error writing TID {tid} -> BE: {e}")
+            
+            print(f"Written BE task types: {written_count} written, {failed_count} failed (Total threads: {len(be_threads)})")
+            print(f"BE Process PIDs: {unique_be_pids}")
+            print(f"BE Thread IDs: {sorted(set(be_threads))}")
+
 def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mode=False):
     os.makedirs(LC_type, exist_ok=True)
     os.makedirs(f"{LC_type}/{BE_type}", exist_ok=True)
@@ -406,7 +459,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
         # cd to spec directory, source shrc (sets up Perl @INC), then run runspec
         BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && taskset -c {First_SMT_silibing_core_ID}-{First_SMT_silibing_core_ID + num_cores - 1} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {num_cores} {BE_type}'"
     elif NUMA_unaware:
-        BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && taskset 0x1111111111 runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 2)} {BE_type}'"
+        BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && taskset 0x1111111111 runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 4)} {BE_type}'"
     else:
         BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores)} {BE_type}'"
     # DEBUGING
@@ -448,15 +501,6 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
             print(f"Warning: Failed to find/open BPF map: {e}")
             print("Continuing without task type mapping...")
 
-    print("Starting background processes (BE)...")
-    be_process = subprocess.Popen(BE_cmd,
-                                stdout=open(f"{LC_type}/{BE_type}/BE.log", "w"), 
-                                stderr=subprocess.STDOUT,
-                                shell=True,
-                                preexec_fn=os.setsid)
-
-    print(f"BE process PID: {be_process.pid}")
-
     # Start LC
     print("Starting LC process...")
     lc_process = None
@@ -478,40 +522,31 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
         print(f"Written LC TID: {lc_tid} to the ring buffer")
         print(f"LC TID: {lc_tid}")
 
-   # Start periodic BE thread updates if map_fd is available or in debug mode
-    be_update_thread = None
-    be_update_stop = threading.Event()
-    
-    if map_fd is not None or debug_mode:
-        # Wait for processes to start
-        time.sleep(1.5)
-        
-        if debug_mode:
-            print(f"\n[DEBUG MODE] Starting periodic BE thread monitoring...")
-        else:
-            print(f"\nStarting periodic BE task type updates...")
-        print(f"BE process PID: {be_process.pid}")
-        
-        # Start background thread for periodic updates
-        be_update_thread = threading.Thread(
-            target=collect_and_write_be_threads,
-            args=(map_fd, be_process.pid, BE_type, be_update_stop, debug_mode),
-            daemon=True
-        )
-        be_update_thread.start()
-        if debug_mode:
-            print("[DEBUG MODE] Periodic BE thread monitoring started (every 1 seconds)")
-        else:
-            print("Periodic BE thread update started (every 1 seconds)")
+    # Start BE
+    print("Starting background processes (BE)...")
+    be_process = subprocess.Popen(BE_cmd,
+                                stdout=open(f"{LC_type}/{BE_type}/BE.log", "w"), 
+                                stderr=subprocess.STDOUT,
+                                shell=True,
+                                preexec_fn=os.setsid)
+
+    print(f"BE process PID: {be_process.pid}")
+
+    # Once every 1s, collect and write BE process and sub-process PIDs to ring buffer
+    while True:
+        collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode)
+        print("Collect BE process and sub-process PIDs...")
+        time.sleep(1)
+
+        if lc_process.poll() is not None:
+            print("LC process completed, stopping BE process collection...")
+            break
     
     try:
         # Wait for LC process
         if lc_process:
             try:
                 lc_process.wait()
-                # Signal timeout thread to stop (process completed normally)
-                if lc_timeout_thread:
-                    lc_timeout_stop.set()
                 print("LC process completed")
             except Exception as e:
                 print(f"Error waiting for LC process: {e}")
@@ -536,14 +571,6 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
                     lc_process.wait()
         except (ProcessLookupError, AttributeError):
             pass
-    
-    # # Stop periodic updates
-    if be_update_thread is not None:
-        print("Stopping periodic BE thread updates...")
-        be_update_stop.set()
-        be_update_thread.join(timeout=2.0)
-        if be_update_thread.is_alive():
-            print("Warning: BE update thread did not stop gracefully")
     
     # Check if BE process is still running and terminate it
     try:
