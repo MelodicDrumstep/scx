@@ -511,6 +511,14 @@ struct {
 	__uint(map_flags, 0);
 } task_type_ring_buffer SEC(".maps");
 
+/* Per-CPU map to track running task type: -1 = none, 0 = LC, 1 = BE */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(s8));
+	__uint(max_entries, MAX_CPUS);
+} cpu_running_task_type SEC(".maps");
+
 #define BE_DELAY_PROB_PERCENTAGE 99U
 #define BE_DISPATCH_PROB_PERCENTAGE 1U  /* 1% chance to dispatch from pending DSQ */
 
@@ -554,6 +562,79 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 		taskc->task_type = -1;
 	}
 }
+
+/* Update the running task type on a CPU */
+static void update_cpu_running_task_type(s32 cpu, s8 task_type)
+{
+	const u32 zero = 0;
+	s8 *cpu_task_type;
+
+	if (cpu < 0 || cpu >= nr_cpu_ids)
+		return;
+
+	cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
+	if (cpu_task_type)
+		*cpu_task_type = task_type;
+}
+
+/* Check if a CPU has a BE task running */
+static bool cpu_has_be_running(s32 cpu)
+{
+	const u32 zero = 0;
+	s8 *cpu_task_type;
+
+	if (cpu < 0 || cpu >= nr_cpu_ids)
+		return false;
+
+	cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
+	if (!cpu_task_type)
+		return false;
+
+	return *cpu_task_type == 1; /* BE = 1 */
+}
+
+/* Get SMT sibling CPU. Returns -1 if not found or no sibling. */
+/* This uses a heuristic: in typical systems, SMT siblings are often */
+/* separated by half the total number of CPUs (e.g., CPU 0 and CPU N/2) */
+static s32 get_smt_sibling(s32 cpu)
+{
+	s32 sibling = -1;
+	s32 i;
+
+	if (cpu < 0 || cpu >= nr_cpu_ids)
+		return -1;
+
+	/* Common pattern: SMT siblings are often cpu and cpu + (nr_cpu_ids / 2) */
+	/* This works for systems where cores are numbered sequentially */
+	if (nr_cpu_ids > 1) {
+		s32 half_cpus = nr_cpu_ids / 2;
+		s32 candidate = cpu + half_cpus;
+		
+		if (candidate < nr_cpu_ids && candidate != cpu) {
+			sibling = candidate;
+		} else {
+			/* Try the other direction */
+			candidate = cpu - half_cpus;
+			if (candidate >= 0 && candidate != cpu) {
+				sibling = candidate;
+			}
+		}
+	}
+
+	/* Fallback: try adjacent CPUs that might be on the same core */
+	/* This is architecture-dependent and may not always work */
+	if (sibling < 0) {
+		/* Try CPU + 1 if it exists and might be a sibling */
+		if (cpu + 1 < nr_cpu_ids && (cpu / 2) == ((cpu + 1) / 2)) {
+			sibling = cpu + 1;
+		} else if (cpu - 1 >= 0 && (cpu / 2) == ((cpu - 1) / 2)) {
+			sibling = cpu - 1;
+		}
+	}
+
+	return sibling;
+}
+
 
 static bool should_delay_be_task(struct task_ctx *taskc)
 {
@@ -926,6 +1007,97 @@ static bool task_set_domain(struct task_struct *p __arg_trusted,
 }
 
 
+/* Find a suitable CPU for LC task: idle, no BE on CPU, no BE on SMT sibling */
+static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
+			   struct bpf_cpumask *p_cpumask)
+{
+	const struct cpumask *idle_cpumask;
+	s32 cpu, sibling;
+	s32 best_cpu = -1;
+	s32 cpu_with_be_sibling = -1; /* CPU with no BE but sibling has BE */
+	s32 i;
+
+	idle_cpumask = scx_bpf_get_idle_cpumask();
+	if (!idle_cpumask)
+		return -ENOENT;
+
+	/* First pass: find CPUs that are idle, have no BE, and SMT sibling has no BE */
+	for (i = 0; i < nr_cpu_ids; i++) {
+		if (!bpf_cpumask_test_cpu(i, cast_mask(p_cpumask)))
+			continue;
+
+		if (!bpf_cpumask_test_cpu(i, idle_cpumask))
+			continue;
+
+		if (cpu_has_be_running(i))
+			continue;
+
+		sibling = get_smt_sibling(i);
+		if (sibling >= 0 && cpu_has_be_running(sibling)) {
+			/* This CPU is good but sibling has BE - save for later */
+			if (cpu_with_be_sibling < 0)
+				cpu_with_be_sibling = i;
+			continue;
+		}
+
+		/* Perfect match: idle, no BE on CPU, no BE on sibling */
+		if (scx_bpf_test_and_clear_cpu_idle(i)) {
+			best_cpu = i;
+			break;
+		}
+	}
+
+	/* If we found a perfect CPU, use it */
+	if (best_cpu >= 0) {
+		scx_bpf_put_idle_cpumask(idle_cpumask);
+		return best_cpu;
+	}
+
+	/* Second pass: if we found a CPU with BE on sibling, kick BE from sibling */
+	if (cpu_with_be_sibling >= 0) {
+		sibling = get_smt_sibling(cpu_with_be_sibling);
+		if (sibling >= 0 && cpu_has_be_running(sibling)) {
+			/* Kick the BE task on the sibling CPU */
+			scx_bpf_kick_cpu(sibling, 0);
+			/* Try to get the CPU */
+			if (scx_bpf_test_and_clear_cpu_idle(cpu_with_be_sibling)) {
+				scx_bpf_put_idle_cpumask(idle_cpumask);
+				return cpu_with_be_sibling;
+			}
+		}
+	}
+
+	/* Third pass: find any idle CPU with no BE, kick BE from both CPU and sibling if needed */
+	for (i = 0; i < nr_cpu_ids; i++) {
+		if (!bpf_cpumask_test_cpu(i, cast_mask(p_cpumask)))
+			continue;
+
+		if (!bpf_cpumask_test_cpu(i, idle_cpumask))
+			continue;
+
+		if (cpu_has_be_running(i)) {
+			/* Kick BE from this CPU */
+			scx_bpf_kick_cpu(i, 0);
+			continue;
+		}
+
+		sibling = get_smt_sibling(i);
+		if (sibling >= 0 && cpu_has_be_running(sibling)) {
+			/* Kick BE from sibling */
+			scx_bpf_kick_cpu(sibling, 0);
+		}
+
+		/* Try to get the CPU after kicking */
+		if (scx_bpf_test_and_clear_cpu_idle(i)) {
+			scx_bpf_put_idle_cpumask(idle_cpumask);
+			return i;
+		}
+	}
+
+	scx_bpf_put_idle_cpumask(idle_cpumask);
+	return -ENOENT;
+}
+
 static s32 try_sync_wakeup(struct task_struct *p, struct task_ctx *taskc,
 			   s32 prev_cpu)
 {
@@ -1013,6 +1185,16 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 			cpu = prev_cpu >= 0 && prev_cpu < nr_cpu_ids ? prev_cpu : 0;
 		scx_bpf_put_idle_cpumask(idle_smtmask);
 		return cpu;
+	}
+
+	/* LC task wakeup logic: find suitable CPU or kick BE to make room */
+	if (taskc->task_type == 0) { /* LC = 0 */
+		cpu = find_cpu_for_lc(p, taskc, p_cpumask);
+		if (cpu >= 0) {
+			stat_add(RUSTY_STAT_DIRECT_DISPATCH, 1);
+			goto direct;
+		}
+		/* If no suitable CPU found, fall through to normal scheduling */
 	}
 
 	if (p->nr_cpus_allowed == 1) {
@@ -1490,12 +1672,41 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	/* Check pending DSQ with 1% probability */
+	/* Only dispatch BE tasks if current CPU doesn't have LC running and its sibling has no LC running */
 	if ((bpf_get_prandom_u32() % 100) < BE_DISPATCH_PROB_PERCENTAGE) {
-		if (scx_bpf_dsq_move_to_local(PENDING_DSQ_ID)) {
-			stat_add(RUSTY_STAT_BE_DELAYED, 1);
-			if (debug >= 2)
-				bpf_printk("[TASK_TYPE] Dispatched BE task from pending DSQ on CPU %d", cpu);
-			return;
+		const u32 zero = 0;
+		s8 *cpu_task_type;
+		s32 sibling;
+		bool can_dispatch = true;
+		
+		/* Check if current CPU has LC task running - if so, skip BE dispatch */
+		cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
+		if (cpu_task_type && *cpu_task_type == 0) {
+			/* Current CPU has LC running */
+			can_dispatch = false;
+		}
+		
+		/* Check if SMT sibling has LC task running */
+		if (can_dispatch) {
+			sibling = get_smt_sibling(cpu);
+			if (sibling >= 0) {
+				cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, sibling);
+				if (cpu_task_type && *cpu_task_type == 0) {
+					/* SMT sibling has LC running */
+					can_dispatch = false;
+				}
+			}
+		}
+		
+		/* Only dispatch BE if neither CPU nor sibling has LC running */
+		if (can_dispatch) {
+			if (scx_bpf_dsq_move_to_local(PENDING_DSQ_ID)) {
+				stat_add(RUSTY_STAT_BE_DELAYED, 1);
+				if (debug >= 2) {
+					bpf_printk("[TASK_TYPE] Dispatched BE task from pending DSQ on CPU %d", cpu);
+				}
+				return;
+			}
 		}
 	}
 
@@ -1612,6 +1823,7 @@ void BPF_STRUCT_OPS(rusty_running, struct task_struct *p)
 	struct task_ctx *taskc;
 	dom_ptr domc;
 	u32 dap_gen;
+	s32 cpu;
 
 	if (!(taskc = lookup_task_ctx(p)))
 		return;
@@ -1620,6 +1832,12 @@ void BPF_STRUCT_OPS(rusty_running, struct task_struct *p)
 	if (!domc) {
 		scx_bpf_error("Invalid dom ID");
 		return;
+	}
+
+	/* Update CPU running task type tracking */
+	cpu = scx_bpf_task_cpu(p);
+	if (taskc->task_type >= 0) {
+		update_cpu_running_task_type(cpu, taskc->task_type);
 	}
 
 	/*
@@ -1672,6 +1890,7 @@ void BPF_STRUCT_OPS(rusty_stopping, struct task_struct *p, bool runnable)
 {
 	struct task_ctx *taskc;
 	dom_ptr domc;
+	s32 cpu;
 
 	if (fifo_sched)
 		return;
@@ -1681,6 +1900,10 @@ void BPF_STRUCT_OPS(rusty_stopping, struct task_struct *p, bool runnable)
 
 	if (!(domc = task_domain(taskc)))
 		return;
+
+	/* Clear CPU running task type tracking */
+	cpu = scx_bpf_task_cpu(p);
+	update_cpu_running_task_type(cpu, -1);
 
 	stopping_update_vtime(p, taskc, domc);
 }

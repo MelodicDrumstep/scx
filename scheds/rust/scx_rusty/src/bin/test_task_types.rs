@@ -233,11 +233,18 @@ fn write_task_type_update(
     Ok(true)
 }
 
-/// Launch a simple busy loop program
+/// Launch a simple busy loop program pinned to specific CPUs
+/// CPUs used: 0, 4, 8, 12, 16, 20, 24, 28, 32, 36 (10 cores total)
 fn launch_busy_loop(task_id: usize, task_type: &str) -> Result<TaskInfo> {
-    // Launch a simple busy loop program
-    // We'll use a simple shell command that runs a busy loop
-    let child = Command::new("sh")
+    // Map task_id to one of the 10 cores: 0, 4, 8, 12, 16, 20, 24, 28, 32, 36
+    const CORES: [usize; 10] = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36];
+    let cpu = CORES[task_id % 10];
+    
+    // Launch a simple busy loop program pinned to the specific CPU using taskset
+    let child = Command::new("taskset")
+        .arg("-c")
+        .arg(cpu.to_string())
+        .arg("sh")
         .arg("-c")
         .arg(format!(
             "while true; do :; done"
@@ -256,7 +263,7 @@ fn launch_busy_loop(task_id: usize, task_type: &str) -> Result<TaskInfo> {
         _ => return Err(anyhow!("Invalid task type: {}", task_type)),
     };
 
-    println!("Launched {} task #{} with PID {}", task_type, task_id, pid);
+    println!("Launched {} task #{} with PID {} on CPU {}", task_type, task_id, pid, cpu);
 
     Ok(TaskInfo {
         child,
