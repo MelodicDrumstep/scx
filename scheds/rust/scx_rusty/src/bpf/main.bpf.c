@@ -87,6 +87,8 @@ const volatile u32 greedy_threshold_x_numa;
 const volatile u32 rusty_perf_mode;
 const volatile u32 debug;
 
+const u32 BE_DISPATCH_PROB = 20; // 20% probability to check for BE task
+
 /* base slice duration */
 volatile u64 slice_ns;
 
@@ -630,10 +632,6 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 	pid = READ_ONCE(p->pid);
 	tgid = BPF_CORE_READ(p, tgid);
 	if (taskc->task_type != TASK_TYPE_UNINITIALIZED) {
-		// if (debug >= 2) {
-			bpf_printk("[assign_task_type] Task type already set for PID=%u (TGID=%u)",
-					   pid, tgid);
-		// }
 		return;
 	}
 	
@@ -642,8 +640,6 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 		taskc->task_type = (s8)TASK_TYPE_BE;
 		task_type_val = TASK_TYPE_BE;
 		bpf_map_update_elem(&task_type_by_pid, &pid, &task_type_val, BPF_ANY);
-		bpf_printk("[assign_task_type] Detected BE task by comm for PID=%u (TGID=%u, %s): TYPE=BE",
-				   pid, tgid, p->comm);
 		return;
 	}
 	
@@ -654,11 +650,6 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 		task_type_val = *entry;
 		/* Convert TASK_TYPE_LC (0) to 0, TASK_TYPE_BE (1) to 1 */
 		taskc->task_type = (s8)task_type_val;
-		/* Only log when task type changes */
-		// if (debug >= 2) {
-			bpf_printk("[assign_task_type] Set task type for PID=%u (TID=%u, %s): TYPE=%s",
-				   tgid, pid, p->comm, task_type_val == TASK_TYPE_LC ? "LC" : "BE");
-		// }
 		return;
 	}
 	
@@ -671,10 +662,6 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 			task_type_val = *entry;
 			taskc->task_type = (s8)task_type_val;
 			bpf_map_update_elem(&task_type_by_pid, &pid, &task_type_val, BPF_ANY);
-			// if (debug >= 2) {
-				bpf_printk("[assign_task_type] Inherited task type for TID=%u (TGID=%u, %s): TYPE=%s",
-						   pid, tgid, p->comm, task_type_val == TASK_TYPE_LC ? "LC" : "BE");
-			// }
 			return;
 		}
 	}
@@ -685,22 +672,12 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 
 	if (parent) {
 		parent_tgid = BPF_CORE_READ(parent, tgid);
-		// if (debug >= 2) {
-			bpf_printk("[assign_task_type] Checking parent process PID=%u for PID=%u (TGID=%u)",
-					   parent_tgid, pid, tgid);
-		// }
 
 		entry = bpf_map_lookup_elem(&task_type_by_pid, &parent_tgid);
 		if (entry) {
 			task_type_val = *entry;
 			taskc->task_type = (s8)task_type_val;
 			bpf_map_update_elem(&task_type_by_pid, &pid, &task_type_val, BPF_ANY);
-
-			/* Only log when task type changes */
-			// if (debug >= 2) {
-				bpf_printk("[assign_task_type] Inherited task type from parent PID=%u for PID=%u (TGID=%u, %s): TYPE=%s",
-						   parent_tgid, pid, tgid, p->comm, task_type_val == TASK_TYPE_LC ? "LC" : "BE");
-			// }
 			return;
 		}
 		else {
@@ -717,24 +694,11 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 					taskc->task_type = (s8)task_type_val;
 					bpf_map_update_elem(&task_type_by_pid, &parent_tgid, &task_type_val, BPF_ANY);
 					bpf_map_update_elem(&task_type_by_pid, &pid, &task_type_val, BPF_ANY);
-					// DEBUGING
-					bpf_printk("[assign_task_type] Inherited task type from grand parent PID=%u for PID=%u (TGID=%u, %s): TYPE=%s",
-							   grandparent_tgid, pid, tgid, p->comm, task_type_val == TASK_TYPE_LC ? "LC" : "BE");
 					return;
 				}
 			}
 		}
 	}
-	// DEBUGING
-	else {
-		// DEBUGING
-		bpf_printk("[assign_task_type] No parent process found for PID=%u (TGID=%u)",
-				   pid, tgid);
-	}
-	
-	// DEBUGING
-	bpf_printk("[assign_task_type] No task type found for PID=%u (TGID=%u)",
-			   pid, tgid);
 	taskc->task_type = TASK_TYPE_UNINITIALIZED;
 }
 
@@ -1342,20 +1306,10 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 		return prev_cpu >= 0 && prev_cpu < nr_cpu_ids ? prev_cpu : 0;
 	}
 
-	// DEBUGING
-	int old_task_type = taskc->task_type;
 	/* Process ring buffer updates before checking task type */
 	process_task_type_ring_buffer();
 	/* Update task type before checking (in case it was just added) */
-	// DEBUGING
-	bpf_printk("[select_cpu] calling assign_task_type");
 	assign_task_type(taskc, p);
-
-	if (old_task_type != taskc->task_type) {
-		// DEBUGING
-		bpf_printk("[select_cpu] Task type changed from %d to %d for PID=%u (TGID=%u)",
-				   old_task_type, taskc->task_type, p->pid, p->tgid);
-	}
 
 	/* LC task wakeup logic: find suitable CPU or kick BE to make room */
 	if (taskc->task_type == TASK_TYPE_LC) { /* LC = 0 */
@@ -1367,15 +1321,12 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 		/* If no suitable CPU found, fall through to normal scheduling */
 	}
 
-	if (p->nr_cpus_allowed == TASK_TYPE_BE) {
-		cpu = prev_cpu;
-		if (kthreads_local && (p->flags & PF_KTHREAD)) {
-			stat_add(RUSTY_STAT_DIRECT_DISPATCH, 1);
-		} else {
-			stat_add(RUSTY_STAT_PINNED, 1);
-		}
-		goto direct;
-	}
+	// /* BE task: use previous CPU if it's available */
+	// if (taskc->task_type == TASK_TYPE_BE) {
+	// 	// TODO: How to deal with it?
+	// 	// We cannot go to direct, since direct will dispatch the process directly
+	// 	return prev_cpu;
+	// }
 
 	/*
 	 * If WAKE_SYNC and the machine isn't fully saturated, wake up @p to the
@@ -1586,10 +1537,13 @@ skip_greedy:
 	return cpu;
 
 direct:
-	taskc->dispatch_local = true;
+	if (taskc->task_type != TASK_TYPE_BE) {
+		taskc->dispatch_local = true;
+	}
 	/* Ensure we return a valid CPU ID */
 	if (cpu < 0 || cpu >= nr_cpu_ids)
 		cpu = prev_cpu >= 0 && prev_cpu < nr_cpu_ids ? prev_cpu : 0;
+	/* Always release idle_smtmask before returning */
 	scx_bpf_put_idle_cpumask(idle_smtmask);
 	return cpu;
 }
@@ -1613,20 +1567,10 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 		return;
 
 	/* Update task type on every enqueue to catch newly added mappings */
-	// DEBUGING
-	int old_task_type = taskc->task_type;
 	/* Process ring buffer updates before checking task type */
 	process_task_type_ring_buffer();
 	/* Update task type before checking (in case it was just added) */
-	// DEBUGING
-	bpf_printk("[enqueue] calling assign_task_type");
 	assign_task_type(taskc, p);
-
-	if (old_task_type != taskc->task_type) {
-		// DEBUGING
-		bpf_printk("[enqueue] Task type changed from %d to %d for PID=%u (TGID=%u)",
-				   old_task_type, taskc->task_type, p->pid, p->tgid);
-	}
 	
 	/* Check if this is a BE task - enqueue to pending DSQ */
 	if (should_delay_be_task(taskc)) {
@@ -1854,36 +1798,7 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 	if (unlikely(is_offline_cpu(cpu)))
 		return;
 
-	/* Only dispatch BE tasks if current CPU doesn't have LC running and its sibling has no LC running */
-	const u32 zero = 0;
-	s8 *cpu_task_type;
-	s32 sibling;
-	bool can_dispatch_be = false;
-	
-	/* Check if current CPU has no LC task running */
-	cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
-	if (cpu_task_type && *cpu_task_type != TASK_TYPE_LC) {
-		/* Current CPU has no LC task running */
-		sibling = get_smt_sibling(cpu);
-		if (sibling >= 0) {
-			cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, sibling);
-			if (cpu_task_type && *cpu_task_type != TASK_TYPE_LC) {
-					/* Check if SMT sibling has LC task running */
-				can_dispatch_be = true;
-			}
-		}
-	}
-	
-	if (can_dispatch_be) {
-		if (scx_bpf_dsq_move_to_local(PENDING_DSQ_ID)) {
-			stat_add(RUSTY_STAT_BE_DELAYED, 1);
-			if (debug >= 2) {
-				bpf_printk("[TASK_TYPE] Dispatched BE task from pending DSQ on CPU %d", cpu);
-			}
-			return;
-		}
-	}
-
+	u32 cpu_u = (u32)cpu;
 	if (scx_bpf_dsq_move_to_local(curr_dom)) {
 		stat_add(RUSTY_STAT_DSQ_DISPATCH, 1);
 		return;
@@ -1918,12 +1833,55 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 		dom = pcpuc->dom_rr_cur++ % nr_doms;
 
 		if (dom_node_id(dom) == my_node || dom == curr_dom ||
-		    scx_bpf_dsq_nr_queued(dom) >= greedy_threshold_x_numa)
+			scx_bpf_dsq_nr_queued(dom) >= greedy_threshold_x_numa)
 			continue;
 
 		if (scx_bpf_dsq_move_to_local(dom)) {
 			stat_add(RUSTY_STAT_GREEDY_XNUMA, 1);
 			return;
+		}
+	}
+
+	/* Only dispatch BE tasks if current CPU doesn't have LC running and its sibling has no LC running */
+	const u32 zero = 0;
+	s8 *cpu_task_type;
+	s8 *cpu_sibling_task_type;
+	s32 sibling;
+	bool can_dispatch_be = false;
+	
+	/* Check if current CPU has no LC task running */
+	/* Use deterministic probability: check on CPUs where (cpu % 4 == 0) and (cpu % 100 < BE_DISPATCH_PROB) */
+	/* This gives approximately BE_DISPATCH_PROB% probability across eligible CPUs */
+	/* Cast to u32 to avoid signed division error */
+
+	if (!(((cpu_u % 4) == 0) && ((cpu_u % 100) < BE_DISPATCH_PROB))) {
+		cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
+		if (cpu_task_type && *cpu_task_type != TASK_TYPE_LC) {
+			/* Current CPU has no LC task running */
+			sibling = get_smt_sibling(cpu);
+			if (sibling >= 0) {
+				/* Has SMT sibling: check if sibling also has no LC task running */
+				cpu_sibling_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, sibling);
+				if (cpu_sibling_task_type && *cpu_sibling_task_type != TASK_TYPE_LC) {
+					/* Both current CPU and SMT sibling have no LC task running */
+					can_dispatch_be = true;
+				}
+			} else {
+				/* No SMT sibling: current CPU having no LC is sufficient */
+				can_dispatch_be = true;
+				// DEBUGING
+				bpf_printk("[dispatch] We can dispatch BE task on CPU %d since CPU task type is %d and sibling task type is %d", cpu, *cpu_task_type, *cpu_sibling_task_type);
+			}
+		}
+		
+		if (can_dispatch_be) {
+			if (scx_bpf_dsq_move_to_local(PENDING_DSQ_ID)) {
+				stat_add(RUSTY_STAT_BE_DELAYED, 1);
+				// if (debug >= 2) {
+					bpf_printk("[dispatch] Dispatched BE task from pending DSQ on CPU %d", cpu);
+				// }
+				return;
+			}
 		}
 	}
 }
@@ -2239,18 +2197,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rusty_init_task, struct task_struct *p,
 	}
 
 	bpf_rcu_read_lock();
-	// DEBUGING
-	int old_task_type = taskc->task_type;
 	/* Process ring buffer updates before checking task type */
 	process_task_type_ring_buffer();
-	bpf_printk("[init_task] calling assign_task_type. PID=%u (TGID=%u), old_task_type=%d", p->pid, p->tgid, old_task_type);
 	assign_task_type(taskc, p);
-	if (old_task_type != taskc->task_type) {
-		// DEBUGING
-		bpf_printk("[init_task] Task type changed from %d to %d for PID=%u (TGID=%u)",
-				   old_task_type, taskc->task_type, p->pid, p->tgid);
-	}
-
 
 	task_pick_and_set_domain(taskc, p, p->cpus_ptr, true);
 	bpf_rcu_read_unlock();

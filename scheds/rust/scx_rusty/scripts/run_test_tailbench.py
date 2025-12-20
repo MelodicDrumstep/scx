@@ -322,54 +322,6 @@ def kill_all_spec_processes():
     
     print("Killed all SPEC processes")
 
-def pstree_monitor(be_process_pid, output_file, stop_event):
-    """Monitor BE process tree using pstree and write to file every 1 second"""
-    pstree_file = open(output_file, 'w')
-    
-    try:
-        while not stop_event.is_set():
-            try:
-                # Check if BE process still exists
-                if not os.path.exists(f"/proc/{be_process_pid}"):
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    pstree_file.write(f"\n[{timestamp}] BE process (PID {be_process_pid}) no longer exists\n")
-                    pstree_file.flush()
-                    break
-                
-                # Run pstree command
-                result = subprocess.run(
-                    ["pstree", "-p", str(be_process_pid)],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                pstree_file.write(f"\n[{timestamp}]\n")
-                if result.returncode == 0:
-                    pstree_file.write(result.stdout)
-                else:
-                    pstree_file.write(f"Error running pstree: {result.stderr}\n")
-                pstree_file.flush()
-                
-            except subprocess.TimeoutExpired:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                pstree_file.write(f"\n[{timestamp}] pstree command timed out\n")
-                pstree_file.flush()
-            except Exception as e:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                pstree_file.write(f"\n[{timestamp}] Error in pstree monitor: {e}\n")
-                pstree_file.flush()
-            
-            # Sleep for 1 second, but check stop_event periodically
-            for _ in range(10):  # Check every 0.1 seconds
-                if stop_event.is_set():
-                    break
-                time.sleep(0.1)
-    
-    finally:
-        pstree_file.close()
-
 def collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode=False):
     # Recursively collect and write BE process PIDs and sub-process PIDs to ring buffer (one-time)
     if map_fd is not None or debug_mode:
@@ -540,17 +492,6 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
 
     print(f"BE process PID: {be_process.pid}")
 
-    # Start pstree monitoring thread
-    pstree_output_file = f"{LC_type}/{BE_type}/pstree.log"
-    pstree_stop_event = threading.Event()
-    pstree_thread = threading.Thread(
-        target=pstree_monitor,
-        args=(be_process.pid, pstree_output_file, pstree_stop_event),
-        daemon=True
-    )
-    pstree_thread.start()
-    print(f"Started pstree monitoring thread, output: {pstree_output_file}")
-
     # One-time: collect and write BE process and sub-process PIDs to ring buffer
     print("Collecting BE process and sub-process PIDs (one-time)...")
     collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode)
@@ -562,13 +503,6 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
                 print("LC process completed...")
                 break
             time.sleep(1)
-    finally:
-        # Stop pstree monitoring thread
-        pstree_stop_event.set()
-        pstree_thread.join(timeout=2)
-        print("Stopped pstree monitoring thread")
-    
-    try:
         # Wait for LC process
         if lc_process:
             try:
