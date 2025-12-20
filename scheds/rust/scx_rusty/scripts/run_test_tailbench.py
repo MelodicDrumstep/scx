@@ -251,102 +251,59 @@ def get_all_threads_for_processes(pids):
             all_threads.append(pid)
     return all_threads
 
-def collect_and_write_be_threads(map_fd, be_process_pid, BE_type, stop_event, debug_mode=False):
-    """Periodically collect BE process threads and write them to the ring buffer (or print in debug mode)"""
-    update_interval = 0.02 # Update every 0.02 seconds
-    next_update_time = None
-    
-    while not stop_event.is_set():
-        try:
-            # Check if BE process is still running
-            if be_process_pid and os.path.exists(f"/proc/{be_process_pid}"):
-                be_pids = []
-                be_pids.append(be_process_pid)
-                
-                pgid_pids = get_process_group_pids(be_process_pid)
-                be_pids.extend(pgid_pids)
-                
-                # # DEBUGING
-                # print(f"BE PIDs: {be_pids}")
-                # print(f"PGID PIDs: {pgid_pids}")
+def collect_and_write_be_threads(map_fd, be_process_pid, BE_type, debug_mode=False):
+    """One-time collect BE process threads and write them to the ring buffer (or print in debug mode)"""
+    try:
+        # Check if BE process is still running
+        if be_process_pid and os.path.exists(f"/proc/{be_process_pid}"):
+            be_pids = []
+            be_pids.append(be_process_pid)
+            
+            pgid_pids = get_process_group_pids(be_process_pid)
+            be_pids.extend(pgid_pids)
 
-                # For SPEC benchmarks, get descendants and find by name
-                descendant_pids = get_descendant_pids(be_process_pid, max_depth=5)
-                be_pids.extend(descendant_pids)
-
-                # # DEBUGING
-                # print(f"DESCENDANT PIDs: {descendant_pids}")
-                
-                # Get all threads for all BE processes
-                unique_be_pids = sorted(set(be_pids))
-
-                # DEBUGING
-                # print(f"UNIQUE BE PIDs: {unique_be_pids}")
-
-                be_threads = get_all_threads_for_processes(unique_be_pids)
-
-                # DEBUGING
-                # print(f"BE THREADS: {be_threads}")
-                
-                if debug_mode:
-                    # Debug mode: just print thread IDs with timestamp
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    print(f"[{timestamp}] DEBUG: BE Thread IDs ({len(be_threads)} total): {sorted(set(be_threads))}")
-                else:
-                    # Normal mode: Write BE threads to ring buffer (one pass)
-                    written_count = 0
-                    failed_count = 0
-                    for tid in set(be_threads):
-                        try:
-                            if write_task_type_update(map_fd, tid, TASK_TYPE_BE):
-                                written_count += 1
-                            else:
-                                failed_count += 1
-                        except Exception as e:
-                            failed_count += 1
-                            print(f"  Error writing TID {tid} -> BE: {e}")
-                    
-                    # if written_count > 0 or failed_count > 0:
-                    #     print(f"Updated BE task types: {written_count} written, {failed_count} failed (Total threads: {len(be_threads)})")
+            # For SPEC benchmarks, get descendants and find by name
+            descendant_pids = get_descendant_pids(be_process_pid, max_depth=5)
+            be_pids.extend(descendant_pids)
+            
+            # Get all threads for all BE processes
+            unique_be_pids = sorted(set(be_pids))
+            be_threads = get_all_threads_for_processes(unique_be_pids)
+            
+            if debug_mode:
+                # Debug mode: just print thread IDs with timestamp
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                print(f"[{timestamp}] DEBUG: BE Thread IDs ({len(be_threads)} total): {sorted(set(be_threads))}")
             else:
-                # BE process no longer exists
-                if debug_mode:
-                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                    print(f"[{timestamp}] DEBUG: BE process (PID {be_process_pid}) no longer exists, stopping periodic updates")
-                else:
-                    print("BE process no longer exists, stopping periodic updates")
-                break
+                # Normal mode: Write BE threads to ring buffer (one-time)
+                written_count = 0
+                failed_count = 0
+                for tid in set(be_threads):
+                    try:
+                        if write_task_type_update(map_fd, tid, TASK_TYPE_BE):
+                            written_count += 1
+                        else:
+                            failed_count += 1
+                    except Exception as e:
+                        failed_count += 1
+                        print(f"  Error writing TID {tid} -> BE: {e}")
                 
-        except Exception as e:
+                if written_count > 0 or failed_count > 0:
+                    print(f"Written BE task types: {written_count} written, {failed_count} failed (Total threads: {len(be_threads)})")
+        else:
+            # BE process no longer exists
             if debug_mode:
                 timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                print(f"[{timestamp}] DEBUG: Error in periodic BE thread update: {e}")
+                print(f"[{timestamp}] DEBUG: BE process (PID {be_process_pid}) no longer exists")
             else:
-                print(f"Error in periodic BE thread update: {e}")
-        
-        # Sleep until next update time (1 second from start of loop)
-        # This ensures consistent 1-second intervals regardless of work time
-        current_time = time.time()
-        if next_update_time is None:
-            next_update_time = current_time + update_interval
-        if current_time < next_update_time:
-            remaining_sleep = next_update_time - current_time
-            # Sleep in small increments to check stop_event periodically
-            sleep_end_time = current_time + remaining_sleep
-
-            # # # DEBUGING
-            # print(f"next_update_time: {next_update_time}")
-            # print(f"Current time: {current_time}")
-            # print(f"Remaining sleep: {remaining_sleep}")
-            # print(f"Sleep end time: {sleep_end_time}")
-
-            while time.time() < sleep_end_time and not stop_event.is_set():
-                sleep_chunk = min(update_interval / 5, sleep_end_time - time.time())
-                if sleep_chunk > 0:
-                    time.sleep(sleep_chunk)
-        
-        # Set next update time to exactly 0.1 second from now
-        next_update_time = time.time() + update_interval
+                print(f"BE process (PID {be_process_pid}) no longer exists")
+            
+    except Exception as e:
+        if debug_mode:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            print(f"[{timestamp}] DEBUG: Error in BE thread collection: {e}")
+        else:
+            print(f"Error in BE thread collection: {e}")
 
 def kill_all_spec_processes():
     """Kill all runspec and benchmark processes"""
@@ -364,6 +321,54 @@ def kill_all_spec_processes():
             pass
     
     print("Killed all SPEC processes")
+
+def pstree_monitor(be_process_pid, output_file, stop_event):
+    """Monitor BE process tree using pstree and write to file every 1 second"""
+    pstree_file = open(output_file, 'w')
+    
+    try:
+        while not stop_event.is_set():
+            try:
+                # Check if BE process still exists
+                if not os.path.exists(f"/proc/{be_process_pid}"):
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                    pstree_file.write(f"\n[{timestamp}] BE process (PID {be_process_pid}) no longer exists\n")
+                    pstree_file.flush()
+                    break
+                
+                # Run pstree command
+                result = subprocess.run(
+                    ["pstree", "-p", str(be_process_pid)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                pstree_file.write(f"\n[{timestamp}]\n")
+                if result.returncode == 0:
+                    pstree_file.write(result.stdout)
+                else:
+                    pstree_file.write(f"Error running pstree: {result.stderr}\n")
+                pstree_file.flush()
+                
+            except subprocess.TimeoutExpired:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                pstree_file.write(f"\n[{timestamp}] pstree command timed out\n")
+                pstree_file.flush()
+            except Exception as e:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                pstree_file.write(f"\n[{timestamp}] Error in pstree monitor: {e}\n")
+                pstree_file.flush()
+            
+            # Sleep for 1 second, but check stop_event periodically
+            for _ in range(10):  # Check every 0.1 seconds
+                if stop_event.is_set():
+                    break
+                time.sleep(0.1)
+    
+    finally:
+        pstree_file.close()
 
 def collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode=False):
     # Recursively collect and write BE process PIDs and sub-process PIDs to ring buffer (one-time)
@@ -444,9 +449,9 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
             # Use default CPU mask for even cores 0-38 (0x5555555555)
             taskset_cmd = "taskset 0x1111111111 "
         
-        # Construct masstree command
+        # Construct masstree command with 10s sleep to allow scheduler to process ring buffer
         LC_cmd = (
-            f"bash -c 'cd {masstree_dir} && "
+            f"bash -c 'sleep 10 && cd {masstree_dir} && "
             f"TBENCH_QPS={QPS} TBENCH_MAXREQS={MAXREQS} TBENCH_WARMUPREQS={WARMUPREQS} "
             f"TBENCH_MINSLEEPNS={MINSLEEPNS} {taskset_cmd}"
             f"./mttest_integrated -j{NTHREADS} mycsba masstree'"
@@ -457,11 +462,14 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
     
     if num_cores:
         # cd to spec directory, source shrc (sets up Perl @INC), then run runspec
-        BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && taskset -c {First_SMT_silibing_core_ID}-{First_SMT_silibing_core_ID + num_cores - 1} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {num_cores} {BE_type}'"
+        # Add 10s sleep to allow scheduler to process ring buffer
+        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && taskset -c {First_SMT_silibing_core_ID}-{First_SMT_silibing_core_ID + num_cores - 1} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {num_cores} {BE_type}'"
     elif NUMA_unaware:
-        BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && taskset 0x1111111111 runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 4)} {BE_type}'"
+        # Add 10s sleep to allow scheduler to process ring buffer
+        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && taskset 0x1111111111 runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 4)} {BE_type}'"
     else:
-        BE_cmd = f"bash -c 'cd {spec_dir} && . ./shrc && runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores)} {BE_type}'"
+        # Add 10s sleep to allow scheduler to process ring buffer
+        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores)} {BE_type}'"
     # DEBUGING
     # BE_cmd = "sleep 10000"
 
@@ -532,15 +540,33 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
 
     print(f"BE process PID: {be_process.pid}")
 
-    # Once every 1s, collect and write BE process and sub-process PIDs to ring buffer
-    while True:
-        collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode)
-        print("Collect BE process and sub-process PIDs...")
-        time.sleep(1)
+    # Start pstree monitoring thread
+    pstree_output_file = f"{LC_type}/{BE_type}/pstree.log"
+    pstree_stop_event = threading.Event()
+    pstree_thread = threading.Thread(
+        target=pstree_monitor,
+        args=(be_process.pid, pstree_output_file, pstree_stop_event),
+        daemon=True
+    )
+    pstree_thread.start()
+    print(f"Started pstree monitoring thread, output: {pstree_output_file}")
 
-        if lc_process.poll() is not None:
-            print("LC process completed, stopping BE process collection...")
-            break
+    # One-time: collect and write BE process and sub-process PIDs to ring buffer
+    print("Collecting BE process and sub-process PIDs (one-time)...")
+    collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode)
+    
+    # Wait for LC process to complete
+    try:
+        while True:
+            if lc_process.poll() is not None:
+                print("LC process completed...")
+                break
+            time.sleep(1)
+    finally:
+        # Stop pstree monitoring thread
+        pstree_stop_event.set()
+        pstree_thread.join(timeout=2)
+        print("Stopped pstree monitoring thread")
     
     try:
         # Wait for LC process
