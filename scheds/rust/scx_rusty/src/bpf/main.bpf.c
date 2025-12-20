@@ -521,6 +521,18 @@ struct {
 	__uint(max_entries, MAX_CPUS);
 } cpu_running_task_type SEC(".maps");
 
+/* Map to store the last BE kick timestamp (when a BE task was kicked by LC) */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__uint(value_size, sizeof(u64));
+	__uint(max_entries, 1);
+	__uint(map_flags, 0);
+} last_be_kick_timestamp SEC(".maps");
+
+/* Cooldown period after BE kick: 1s in nanoseconds */
+#define BE_KICK_COOLDOWN_NS 1000000000ULL
+
 static inline void stat_add(enum stat_idx idx, u64 addend)
 {
 	u32 idx_v = idx;
@@ -741,6 +753,42 @@ static s32 get_smt_sibling(s32 cpu)
 		return cpu + 20;
 	}
 	return cpu - 20;
+}
+
+/* Record the timestamp when a BE task is kicked by LC */
+static void record_be_kick_timestamp(void)
+{
+	const u32 zero = 0;
+	u64 now = scx_bpf_now();
+	u64 *timestamp;
+
+	timestamp = bpf_map_lookup_elem(&last_be_kick_timestamp, &zero);
+	if (timestamp) {
+		*timestamp = now;
+	}
+}
+
+/* Check if BE dispatch is allowed (not within cooldown period after BE kick) */
+static bool is_be_dispatch_allowed(void)
+{
+	const u32 zero = 0;
+	u64 now = scx_bpf_now();
+	u64 *last_kick_time;
+	u64 cooldown_ns = BE_KICK_COOLDOWN_NS;
+
+	last_kick_time = bpf_map_lookup_elem(&last_be_kick_timestamp, &zero);
+	if (!last_kick_time)
+		return true; /* If map lookup fails, allow dispatch */
+
+	/* If no BE has been kicked yet, allow dispatch */
+	if (*last_kick_time == 0)
+		return true;
+
+	/* Check if we're still within the cooldown period */
+	if (now - *last_kick_time < cooldown_ns)
+		return false;
+
+	return true;
 }
 
 
@@ -1171,10 +1219,12 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 		sibling = get_smt_sibling(cpu_with_be_sibling);
 		if (sibling >= 0 && cpu_has_be_running(sibling)) {
 			// DEBUGING
-			bpf_printk("[find_cpu_for_lc] Kick the BE task on the sibling CPU %d", sibling);
+			// bpf_printk("[find_cpu_for_lc] Kick the BE task on the sibling CPU %d", sibling);
 
 			/* Kick the BE task on the sibling CPU */
 			scx_bpf_kick_cpu(sibling, 0);
+			/* Record the timestamp when BE is kicked */
+			record_be_kick_timestamp();
 			/* Try to get the CPU */
 			if (scx_bpf_test_and_clear_cpu_idle(cpu_with_be_sibling)) {
 				scx_bpf_put_idle_cpumask(idle_cpumask);
@@ -1199,6 +1249,8 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 		if (cpu_has_be_running(i)) {
 			/* Kick BE from this CPU */
 			scx_bpf_kick_cpu(i, 0);
+			/* Record the timestamp when BE is kicked */
+			record_be_kick_timestamp();
 			continue;
 		}
 
@@ -1206,10 +1258,12 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 		if (sibling >= 0 && cpu_has_be_running(sibling)) {
 			/* Kick BE from sibling */
 			scx_bpf_kick_cpu(sibling, 0);
+			/* Record the timestamp when BE is kicked */
+			record_be_kick_timestamp();
 		}
 
 		// DEBUGING
-		bpf_printk("[find_cpu_for_lc] Kick the BE task on the CPU %d", i);
+		// bpf_printk("[find_cpu_for_lc] Kick the BE task on the CPU %d", i);
 
 		/* Try to get the CPU after kicking */
 		if (scx_bpf_test_and_clear_cpu_idle(i)) {
@@ -1304,7 +1358,7 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 			stat_add(RUSTY_STAT_DIRECT_DISPATCH, 1);
 			update_cpu_running_task_type(cpu, TASK_TYPE_LC);
 			// DEBUGING
-			bpf_printk("[select_cpu] Update CPU %d task type to LC", cpu);
+			// bpf_printk("[select_cpu] Update CPU %d task type to LC", cpu);
 			goto direct;
 		}
 		/* If no suitable CPU found, fall through to normal scheduling */
@@ -1802,6 +1856,12 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 	/* Cast to u32 to avoid signed division error */
 
 	if ((cpu_u % 4) == 0 && (bpf_get_prandom_u32() % 100) < BE_DISPATCH_PROB) {
+		/* Check if BE dispatch is allowed (not within cooldown period after BE kick) */
+		if (!is_be_dispatch_allowed()) {
+			bpf_printk("[dispatch] BE dispatch blocked due to cooldown period on CPU %d", cpu);
+			goto skip_be_dispatch;
+		}
+
 		cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
 		if (cpu_task_type && *cpu_task_type == TASK_TYPE_UNINITIALIZED) {
 			/* Current CPU has no LC task running */
@@ -1825,11 +1885,13 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 				// }
 				update_cpu_running_task_type(cpu, TASK_TYPE_BE);
 				// DEBUGING
-				bpf_printk("[dispatch] Update CPU %d task type to BE", cpu);
+				// bpf_printk("[dispatch] Update CPU %d task type to BE", cpu);
 				return;
 			}
 		}
-	} else {
+	}
+skip_be_dispatch:
+	{
 		// When exiting, call "update_cpu_running_task_type(cpu, taskc -> task_type);"
 
 
@@ -2022,7 +2084,7 @@ void BPF_STRUCT_OPS(rusty_stopping, struct task_struct *p, bool runnable)
 	cpu = scx_bpf_task_cpu(p);
 	update_cpu_running_task_type(cpu, -1);
 	// DEBUGING
-	bpf_printk("[stopping] Clear CPU %d task type", cpu);
+	// bpf_printk("[stopping] Clear CPU %d task type", cpu);
 
 	stopping_update_vtime(p, taskc, domc);
 }

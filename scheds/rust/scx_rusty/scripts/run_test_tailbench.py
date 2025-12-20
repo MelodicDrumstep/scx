@@ -14,6 +14,7 @@ TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
 SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "470.lbm", "473.astar", "483.xalancbmk"]
 First_SMT_silibing_core_ID = 20 # Hard coded
 Num_total_cores = 40 # with SMT counted
+lats_bin = TailbenchDir / "masstree" / "lats.bin"
 
 def generate_even_string(x):
     return ','.join(str(num) for num in range(0, x, 2))
@@ -379,6 +380,10 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
     os.makedirs(LC_type, exist_ok=True)
     os.makedirs(f"{LC_type}/{BE_type}", exist_ok=True)
 
+    # delete lats.bin if it exists
+    if lats_bin.exists():
+        os.remove(str(lats_bin))
+
     # Masstree configuration
     if LC_type == "masstree":
         masstree_dir = TailbenchDir / "masstree"
@@ -386,7 +391,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
         MAXREQS = QPS * 60
         WARMUPREQS = QPS
         MINSLEEPNS = 100
-        NTHREADS = os.environ.get("NTHREADS", "20")
+        NTHREADS = os.environ.get("NTHREADS", "10")
         
         # Build taskset command based on num_cores or NUMA_unaware
         taskset_cmd = ""
@@ -550,7 +555,6 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
     
     print("Extract latency from the log file...")
     # Parse results
-    lats_bin = TailbenchDir / "masstree" / "lats.bin"
     results_file = f"{LC_type}/{BE_type}/latency.log"
     
     if not lats_bin.exists():
