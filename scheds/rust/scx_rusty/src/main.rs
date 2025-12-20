@@ -637,26 +637,11 @@ impl<'a> Scheduler<'a> {
         let now = Instant::now();
         let mut next_tune_at = now + self.tune_interval;
         let mut next_sched_at = now + self.sched_interval;
-        // Process task type ring buffer every 10ms (faster than tune interval for responsiveness)
-        let task_type_interval = Duration::from_millis(10);
-        let mut next_task_type_at = now + task_type_interval;
 
         self.skel.maps.stats.value_size() as usize;
 
         while !shutdown.load(Ordering::Relaxed) && !uei_exited!(&self.skel, uei) {
             let now = Instant::now();
-
-            // Process task type ring buffer updates from userspace
-            if now >= next_task_type_at {
-                if let Err(e) = task_type::process_task_type_ring_buffer(&mut self.skel) {
-                    // Log error but don't fail - task type updates are best-effort
-                    log::debug!("Failed to process task type ring buffer: {}", e);
-                }
-                next_task_type_at += task_type_interval;
-                if next_task_type_at < now {
-                    next_task_type_at = now + task_type_interval;
-                }
-            }
 
             if now >= next_tune_at {
                 self.tuner.step(&mut self.skel)?;
@@ -676,7 +661,7 @@ impl<'a> Scheduler<'a> {
 
             self.time_used += Instant::now().duration_since(now);
 
-            match req_ch.recv_deadline(next_sched_at.min(next_tune_at).min(next_task_type_at)) {
+            match req_ch.recv_deadline(next_sched_at.min(next_tune_at)) {
                 Ok(prev_sc) => {
                     let cur_sc = StatsCtx::new(&self.skel, &self.proc_reader, self.time_used)?;
                     let delta_sc = cur_sc.delta(&prev_sc);

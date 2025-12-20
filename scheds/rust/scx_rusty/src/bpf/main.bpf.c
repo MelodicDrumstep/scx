@@ -528,6 +528,95 @@ static inline void stat_add(enum stat_idx idx, u64 addend)
 		(*cnt_p) += addend;
 }
 
+/* Check if process name (comm) matches BE task patterns */
+static bool is_be_process_by_comm(struct task_struct *p)
+{
+	char comm[16]; /* TASK_COMM_LEN is typically 16 */
+	
+	/* Read comm field */
+	if (bpf_core_read(comm, sizeof(comm), &p->comm))
+		return false;
+	
+	/* Check for "specinvoke" (10 chars) */
+	if (comm[0] == 's' && comm[1] == 'p' && comm[2] == 'e' && comm[3] == 'c' &&
+	    comm[4] == 'i' && comm[5] == 'n' && comm[6] == 'v' && comm[7] == 'o' &&
+	    comm[8] == 'k' && comm[9] == 'e' && comm[10] == '\0') {
+		return true;
+	}
+	
+	/* Check for "bzip2_base.x86_" (15 chars) */
+	if (comm[0] == 'b' && comm[1] == 'z' && comm[2] == 'i' && comm[3] == 'p' &&
+	    comm[4] == '2' && comm[5] == '_' && comm[6] == 'b' && comm[7] == 'a' &&
+	    comm[8] == 's' && comm[9] == 'e' && comm[10] == '.' && comm[11] == 'x' &&
+	    comm[12] == '8' && comm[13] == '6' && comm[14] == '_') {
+		return true;
+	}
+	
+	/* Check for "runspec" (7 chars) */
+	if (comm[0] == 'r' && comm[1] == 'u' && comm[2] == 'n' && comm[3] == 's' &&
+	    comm[4] == 'p' && comm[5] == 'e' && comm[6] == 'c' && comm[7] == '\0') {
+		return true;
+	}
+	
+	return false;
+}
+
+/* Process task type updates from the ring buffer and update task_type_by_pid map */
+/* This function processes all available entries in the ring buffer */
+static void process_task_type_ring_buffer(void)
+{
+	const u32 ring_key = 0;
+	struct task_type_ring *ring;
+	u32 producer, consumer;
+	u32 processed = 0;
+	u32 max_process = TASK_TYPE_RING_SIZE; /* Limit processing to avoid long loops */
+	u32 initial_consumer;
+
+	/* Lookup the ring buffer */
+	ring = bpf_map_lookup_elem(&task_type_ring_buffer, &ring_key);
+	if (!ring)
+		return;
+
+	/* Acquire lock and read producer/consumer */
+	bpf_spin_lock(&ring->lock);
+	producer = ring->producer;
+	initial_consumer = ring->consumer;
+	consumer = initial_consumer;
+	bpf_spin_unlock(&ring->lock);
+
+	/* Process entries: consumer to producer */
+	/* Note: We process outside the lock to avoid calling map functions while holding lock */
+	while (consumer != producer && processed < max_process) {
+		u32 idx = consumer % TASK_TYPE_RING_SIZE;
+		struct task_type_entry *entry = &ring->entries[idx];
+		u32 pid = entry->pid;
+		u8 task_type_val = entry->task_type;
+
+		/* Update or delete from task_type_by_pid map */
+		if (task_type_val == TASK_TYPE_LC || task_type_val == TASK_TYPE_BE) {
+			bpf_map_update_elem(&task_type_by_pid, &pid, &task_type_val, BPF_ANY);
+		} else {
+			/* Remove entry if invalid type */
+			bpf_map_delete_elem(&task_type_by_pid, &pid);
+		}
+
+		consumer++;
+		processed++;
+	}
+
+	/* Update consumer index if we processed any entries */
+	if (processed > 0) {
+		bpf_spin_lock(&ring->lock);
+		/* Re-read producer to ensure we don't overwrite new entries */
+		producer = ring->producer;
+		/* Only update consumer if it's still valid (handle wrap-around) */
+		if (consumer <= producer || (producer < initial_consumer && consumer > initial_consumer)) {
+			ring->consumer = consumer;
+		}
+		bpf_spin_unlock(&ring->lock);
+	}
+}
+
 static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 {
 	u32 pid, tgid, parent_tgid;
@@ -545,6 +634,16 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 			bpf_printk("[assign_task_type] Task type already set for PID=%u (TGID=%u)",
 					   pid, tgid);
 		// }
+		return;
+	}
+	
+	/* Check if process name matches BE task patterns */
+	if (is_be_process_by_comm(p)) {
+		taskc->task_type = (s8)TASK_TYPE_BE;
+		task_type_val = TASK_TYPE_BE;
+		bpf_map_update_elem(&task_type_by_pid, &pid, &task_type_val, BPF_ANY);
+		bpf_printk("[assign_task_type] Detected BE task by comm for PID=%u (TGID=%u, %s): TYPE=BE",
+				   pid, tgid, p->comm);
 		return;
 	}
 	
@@ -720,8 +819,8 @@ static bool should_delay_be_task(struct task_ctx *taskc)
 }
 
 /*
- * process_task_type_ring_buffer() has been moved to userspace.
- * Userspace periodically processes the ring buffer and updates task_type_by_pid map directly.
+ * process_task_type_ring_buffer() processes the ring buffer in BPF space.
+ * It's called before assign_task_type() to ensure task type updates are processed immediately.
  */
 
 /*
@@ -1245,6 +1344,8 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 
 	// DEBUGING
 	int old_task_type = taskc->task_type;
+	/* Process ring buffer updates before checking task type */
+	process_task_type_ring_buffer();
 	/* Update task type before checking (in case it was just added) */
 	// DEBUGING
 	bpf_printk("[select_cpu] calling assign_task_type");
@@ -1514,6 +1615,8 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	/* Update task type on every enqueue to catch newly added mappings */
 	// DEBUGING
 	int old_task_type = taskc->task_type;
+	/* Process ring buffer updates before checking task type */
+	process_task_type_ring_buffer();
 	/* Update task type before checking (in case it was just added) */
 	// DEBUGING
 	bpf_printk("[enqueue] calling assign_task_type");
@@ -2138,6 +2241,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(rusty_init_task, struct task_struct *p,
 	bpf_rcu_read_lock();
 	// DEBUGING
 	int old_task_type = taskc->task_type;
+	/* Process ring buffer updates before checking task type */
+	process_task_type_ring_buffer();
 	bpf_printk("[init_task] calling assign_task_type. PID=%u (TGID=%u), old_task_type=%d", p->pid, p->tgid, old_task_type);
 	assign_task_type(taskc, p);
 	if (old_task_type != taskc->task_type) {
