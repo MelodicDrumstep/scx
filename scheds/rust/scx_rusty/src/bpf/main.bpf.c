@@ -87,7 +87,7 @@ const volatile u32 greedy_threshold_x_numa;
 const volatile u32 rusty_perf_mode;
 const volatile u32 debug;
 
-const u32 BE_DISPATCH_PROB = 10; // 10% probability to check for BE task
+const u32 BE_DISPATCH_PROB = 15; // 15% probability to check for BE task
 
 /* base slice duration */
 volatile u64 slice_ns;
@@ -555,14 +555,6 @@ static bool is_be_process_by_comm(struct task_struct *p)
 	if (comm[0] == 's' && comm[1] == 'p' && comm[2] == 'e' && comm[3] == 'c' &&
 	    comm[4] == 'i' && comm[5] == 'n' && comm[6] == 'v' && comm[7] == 'o' &&
 	    comm[8] == 'k' && comm[9] == 'e' && comm[10] == '\0') {
-		return true;
-	}
-	
-	/* Check for "bzip2_base.x86_" (15 chars) */
-	if (comm[0] == 'b' && comm[1] == 'z' && comm[2] == 'i' && comm[3] == 'p' &&
-	    comm[4] == '2' && comm[5] == '_' && comm[6] == 'b' && comm[7] == 'a' &&
-	    comm[8] == 's' && comm[9] == 'e' && comm[10] == '.' && comm[11] == 'x' &&
-	    comm[12] == '8' && comm[13] == '6' && comm[14] == '_') {
 		return true;
 	}
 	
