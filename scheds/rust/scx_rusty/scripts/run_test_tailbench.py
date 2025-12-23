@@ -376,18 +376,29 @@ def collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_
             print(f"BE Process PIDs: {unique_be_pids}")
             print(f"BE Thread IDs: {sorted(set(be_threads))}")
 
-def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mode=False):
+def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None, debug_mode=False):
     os.makedirs(LC_type, exist_ok=True)
-    os.makedirs(f"{LC_type}/{BE_type}", exist_ok=True)
+    os.makedirs(f"{LC_type}/{pressure}", exist_ok=True)
+    os.makedirs(f"{LC_type}/{pressure}/{BE_type}", exist_ok=True)
 
     # delete lats.bin if it exists
     if lats_bin.exists():
         os.remove(str(lats_bin))
 
+    # Pressure level to number
+    if pressure == 'low':
+        pressure_num = 0.3
+    elif pressure == 'medium':
+        pressure_num = 0.5
+    elif pressure == 'high':
+        pressure_num = 0.7
+    else:
+        raise Exception("Invalid pressure level, only [low / medium / high] are supported")
+
     # Masstree configuration
     if LC_type == "masstree":
         masstree_dir = TailbenchDir / "masstree"
-        QPS = 6410
+        QPS = int(6410 * pressure_num)
         MAXREQS = QPS * 60
         WARMUPREQS = QPS
         MINSLEEPNS = 100
@@ -472,7 +483,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
     try:
         lc_process = subprocess.Popen(LC_cmd,
                                     shell=True,
-                                    stdout=open(f"{LC_type}/{BE_type}/LC.log", "w"), 
+                                    stdout=open(f"{LC_type}/{pressure}/{BE_type}/LC.log", "w"), 
                                     stderr=subprocess.STDOUT)
         print(f"LC process PID: {lc_process.pid}")
     except Exception as e:
@@ -490,7 +501,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
     # Start BE
     print("Starting background processes (BE)...")
     be_process = subprocess.Popen(BE_cmd,
-                                stdout=open(f"{LC_type}/{BE_type}/BE.log", "w"), 
+                                stdout=open(f"{LC_type}/{pressure}/{BE_type}/BE.log", "w"), 
                                 stderr=subprocess.STDOUT,
                                 shell=True,
                                 preexec_fn=os.setsid)
@@ -555,7 +566,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, task_type_shm=None, debug_mod
     
     print("Extract latency from the log file...")
     # Parse results
-    results_file = f"{LC_type}/{BE_type}/latency.log"
+    results_file = f"{LC_type}/{pressure}/{BE_type}/latency.log"
     
     if not lats_bin.exists():
         print(f"WARNING: {lats_bin} not found after benchmark run")
@@ -596,7 +607,15 @@ if __name__ == "__main__":
     parser.add_argument('--NUMA_unaware', action = 'store_true', help = 'To only set one NUMA node, only needed when \"num_cores\" is not given.')
     parser.add_argument('--task-type-shm', type = str, help = 'Path to the BPF map for task type ring buffer (e.g., /sys/fs/bpf/scx_rusty_task_types)')
     parser.add_argument('--debug', action = 'store_true', help = 'Debug mode: print BE thread IDs with timestamps instead of writing to BPF map')
+    parser.add_argument('-p', '--pressure', type =str, choices = ['low', 'medium', 'high'], help = 'The pressure level to set for the LC process, [low / medium / high]')
     args = parser.parse_args()
+
+    if args.pressure:
+        if args.pressure not in ['low', 'medium', 'high']:
+            raise Exception("Invalid pressure level, only [low / medium / high] are supported")
+        pressure = args.pressure
+    else:
+        raise Exception("Pressure level is not given")
     
     # num_cores == None means we do not bind cores
     num_cores = None
@@ -617,8 +636,8 @@ if __name__ == "__main__":
         if args.BE:
             print("Warning : \"run all\" is set, ignoring given BE")
         for BE_type in SPEC_2006_BE_list:
-            run(LC_type, BE_type, num_cores, args.NUMA_unaware, args.task_type_shm, args.debug)
+            run(LC_type, BE_type, num_cores, args.NUMA_unaware, pressure, args.task_type_shm, args.debug)
         exit()
 
-    run(LC_type, args.BE, num_cores, args.NUMA_unaware, args.task_type_shm, args.debug)
+    run(LC_type, args.BE, num_cores, args.NUMA_unaware, pressure, args.task_type_shm, args.debug)
     
