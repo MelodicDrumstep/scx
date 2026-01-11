@@ -14,7 +14,6 @@ TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
 SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "470.lbm", "473.astar", "483.xalancbmk"]
 First_SMT_silibing_core_ID = 20 # Hard coded
 Num_total_cores = 40 # with SMT counted
-lats_bin = TailbenchDir / "masstree" / "lats.bin"
 
 def generate_even_string(x):
     return ','.join(str(num) for num in range(0, x, 2))
@@ -381,10 +380,6 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
     os.makedirs(f"{LC_type}/{pressure}", exist_ok=True)
     os.makedirs(f"{LC_type}/{pressure}/{BE_type}", exist_ok=True)
 
-    # delete lats.bin if it exists
-    if lats_bin.exists():
-        os.remove(str(lats_bin))
-
     # Pressure level to number
     if pressure == 'low':
         pressure_num = 0.3
@@ -397,8 +392,9 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
 
     # Masstree configuration
     if LC_type == "masstree":
+        lats_bin = TailbenchDir / "masstree" / "lats.bin"
         masstree_dir = TailbenchDir / "masstree"
-        QPS = int(6410 * pressure_num)
+        QPS = int(11700 * pressure_num)
         MAXREQS = QPS * 60
         WARMUPREQS = QPS
         MINSLEEPNS = 100
@@ -424,6 +420,24 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
             f"TBENCH_MINSLEEPNS={MINSLEEPNS} {taskset_cmd}"
             f"./mttest_integrated -j{NTHREADS} mycsba masstree'"
         )
+
+    elif LC_type == "specjbb":
+        lats_bin = TailbenchDir / "specjbb" / "lats.bin"
+        SPECJBB_DIR = TailbenchDir / "specjbb"
+        qps = 140000
+        run_sh = SPECJBB_DIR / "run.sh"
+        if not run_sh.exists():
+            print(f"ERROR: {run_sh} not found")
+            return False
+
+        # sleep 10s first
+        LC_cmd = (
+            f"bash -c 'sleep 10 && {run_sh} {qps}'"
+        )
+
+    # delete lats.bin if it exists
+    if lats_bin.exists():
+        os.remove(str(lats_bin))
 
     # SPEC CPU environment - need to cd to directory and source shrc to set up Perl environment
     spec_dir = os.path.expanduser("/home/dell-07/wltu/speccpu2006-v1.0.1")
@@ -600,7 +614,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(epilog = 'Usage : run_exp.py --LC <LC_type> [--BE <BE_type> / --run_all_SPEC] [-n <num_cores>]')
-    parser.add_argument('--LC', choices = ['masstree'], help = 'The LC type')
+    parser.add_argument('--LC', choices = ['masstree', 'specjbb'], help = 'The LC type')
     parser.add_argument('--BE', choices = SPEC_2006_BE_list, help = 'The BE type')
     parser.add_argument('--run_all_SPEC', action = 'store_true', help = 'To run all of the BE inside SPEC2006 one by one')
     parser.add_argument('-n', '--num_cores', type = int, help = 'The number of cores to for LC and BE each. If not given, we won\'t bind cores.')
