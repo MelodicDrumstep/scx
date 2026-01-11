@@ -16,8 +16,8 @@ use std::time::Duration;
 use std::thread;
 
 const TASK_TYPE_RING_SIZE: usize = 1024;
-const TASK_TYPE_LC: u8 = 0;
-const TASK_TYPE_BE: u8 = 1;
+const TASK_TYPE_LC: u8 = 2;
+const TASK_TYPE_BE: u8 = 3;
 
 /// Guard to ensure map FD is closed
 struct MapFdGuard(RawFd);

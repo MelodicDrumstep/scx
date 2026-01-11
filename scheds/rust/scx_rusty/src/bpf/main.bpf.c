@@ -652,7 +652,7 @@ static void assign_task_type(struct task_ctx *taskc, struct task_struct *p)
 	entry = bpf_map_lookup_elem(&task_type_by_pid, &pid);
 	if (entry) {
 		task_type_val = *entry;
-		/* Convert TASK_TYPE_LC (0) to 0, TASK_TYPE_BE (1) to 1 */
+		/* Convert TASK_TYPE_LC (2) to 2, TASK_TYPE_BE (3) to 3 */
 		taskc->task_type = (s8)task_type_val;
 		return;
 	}
@@ -712,12 +712,14 @@ static void update_cpu_running_task_type(s32 cpu, s8 task_type)
 	const u32 zero = 0;
 	s8 *cpu_task_type;
 
-	if (cpu < 0 || cpu >= nr_cpu_ids)
+	if (cpu < 0 || cpu >= nr_cpu_ids) {
 		return;
+	}
 
 	cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
-	if (cpu_task_type)
+	if (cpu_task_type) {
 		*cpu_task_type = task_type;
+	}
 }
 
 /* Check if a CPU has a BE task running */
@@ -1213,6 +1215,8 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 			// DEBUGING
 			// bpf_printk("[find_cpu_for_lc] Kick the BE task on the sibling CPU %d", sibling);
 
+			update_cpu_running_task_type(sibling, TASK_TYPE_UNINITIALIZED);
+
 			/* Kick the BE task on the sibling CPU */
 			scx_bpf_kick_cpu(sibling, 0);
 			/* Record the timestamp when BE is kicked */
@@ -1249,6 +1253,8 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 		sibling = get_smt_sibling(i);
 		if (sibling >= 0 && cpu_has_be_running(sibling)) {
 			/* Kick BE from sibling */
+			update_cpu_running_task_type(sibling, TASK_TYPE_UNINITIALIZED);
+
 			scx_bpf_kick_cpu(sibling, 0);
 			/* Record the timestamp when BE is kicked */
 			record_be_kick_timestamp();
@@ -1344,7 +1350,7 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 	assign_task_type(taskc, p);
 
 	/* LC task wakeup logic: find suitable CPU or kick BE to make room */
-	if (taskc->task_type == TASK_TYPE_LC) { /* LC = 0 */
+	if (taskc->task_type == TASK_TYPE_LC) { /* LC = 2 */
 		cpu = find_cpu_for_lc(p, taskc, p_cpumask);
 		if (cpu >= 0) {
 			stat_add(RUSTY_STAT_DIRECT_DISPATCH, 1);
