@@ -530,6 +530,15 @@ struct {
 	__uint(map_flags, 0);
 } last_be_kick_timestamp SEC(".maps");
 
+/* Map to store high latency flag (set by userspace when p99 latency > 200000 ns) */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(key_size, sizeof(u32));
+	__type(value, bool);
+	__uint(max_entries, 1);
+	__uint(map_flags, 0);
+} high_latency_flag SEC(".maps");
+
 /* Cooldown period after BE kick: 1s in nanoseconds */
 #define BE_KICK_COOLDOWN_NS 1000000000ULL
 
@@ -783,6 +792,19 @@ static bool is_be_dispatch_allowed(void)
 		return false;
 
 	return true;
+}
+
+/* Check if high latency flag is set */
+static bool is_high_latency(void)
+{
+	const u32 zero = 0;
+	bool *flag;
+
+	flag = bpf_map_lookup_elem(&high_latency_flag, &zero);
+	if (!flag)
+		return false; /* If map lookup fails, assume normal latency */
+
+	return *flag;
 }
 
 
@@ -1215,7 +1237,7 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 			// DEBUGING
 			// bpf_printk("[find_cpu_for_lc] Kick the BE task on the sibling CPU %d", sibling);
 
-			update_cpu_running_task_type(sibling, TASK_TYPE_UNINITIALIZED);
+			// update_cpu_running_task_type(sibling, TASK_TYPE_UNINITIALIZED);
 
 			/* Kick the BE task on the sibling CPU */
 			scx_bpf_kick_cpu(sibling, 0);
@@ -1252,8 +1274,8 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 
 		sibling = get_smt_sibling(i);
 		if (sibling >= 0 && cpu_has_be_running(sibling)) {
-			/* Kick BE from sibling */
-			update_cpu_running_task_type(sibling, TASK_TYPE_UNINITIALIZED);
+			// /* Kick BE from sibling */
+			// update_cpu_running_task_type(sibling, TASK_TYPE_UNINITIALIZED);
 
 			scx_bpf_kick_cpu(sibling, 0);
 			/* Record the timestamp when BE is kicked */
@@ -1860,6 +1882,14 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 			goto skip_be_dispatch;
 		}
 
+		/* Check if high latency is detected - can be used to adjust scheduling behavior */
+		if (is_high_latency()) {
+			/* High latency detected - could adjust BE dispatch behavior here */
+			/* For example: reduce BE dispatch probability or delay BE tasks further */
+			bpf_printk("[dispatch] High latency detected - could adjust BE dispatch behavior here");
+			goto skip_be_dispatch;
+		}
+
 		cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
 		if (cpu_task_type && *cpu_task_type == TASK_TYPE_UNINITIALIZED) {
 			/* Current CPU has no LC task running */
@@ -1891,8 +1921,6 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 skip_be_dispatch:
 	{
 		// When exiting, call "update_cpu_running_task_type(cpu, taskc -> task_type);"
-
-
 		if (scx_bpf_dsq_move_to_local(curr_dom)) {
 			stat_add(RUSTY_STAT_DSQ_DISPATCH, 1);
 			return;

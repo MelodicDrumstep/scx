@@ -42,7 +42,10 @@ use anyhow::Result;
 use clap::Parser;
 use crossbeam::channel::RecvTimeoutError;
 use libbpf_rs::MapCore as _;
+use libbpf_rs::MapFlags;
 use libbpf_rs::OpenObject;
+use libbpf_sys;
+use libc;
 use log::info;
 use scx_stats::prelude::*;
 use scx_utils::build_id;
@@ -366,6 +369,10 @@ struct Scheduler<'a> {
 
     tuner: Tuner,
     stats_server: StatsServer<StatsCtx, (StatsCtx, ClusterStats)>,
+
+    latency_map_fd: Option<i32>,  // File descriptor for external latency map
+    latency_check_interval: Duration,
+    next_latency_check: Instant,
 }
 
 impl<'a> Scheduler<'a> {
@@ -521,6 +528,22 @@ impl<'a> Scheduler<'a> {
         // Other stuff.
         let proc_reader = procfs::ProcReader::new();
 
+        // Open external latency map for monitoring
+        let latency_map_path = "/sys/fs/bpf/latency_map_path";
+        let latency_map_fd = unsafe {
+            let path_cstr = std::ffi::CString::new(latency_map_path)
+                .context("Failed to create CString for latency map path")?;
+            let fd = libbpf_sys::bpf_obj_get(path_cstr.as_ptr() as *const libc::c_char);
+            if fd < 0 {
+                info!("Warning: Failed to open latency map at {}: {}. Latency monitoring disabled.", 
+                      latency_map_path, std::io::Error::last_os_error());
+                None
+            } else {
+                info!("Successfully opened latency map at {}", latency_map_path);
+                Some(fd)
+            }
+        };
+
         Ok(Self {
             skel,
             struct_ops, // should be held to keep it attached
@@ -545,6 +568,10 @@ impl<'a> Scheduler<'a> {
                 opts.slice_us_overutil * 1000,
             )?,
             stats_server,
+
+            latency_map_fd,
+            latency_check_interval: Duration::from_millis(100), // Check every 100ms
+            next_latency_check: Instant::now(),
         })
     }
 
@@ -632,11 +659,59 @@ impl<'a> Scheduler<'a> {
         Ok(())
     }
 
+    fn check_latency(&mut self) -> Result<()> {
+        const LATENCY_THRESHOLD_NS: u32 = 1500000;
+        const MAP_KEY: u32 = 0;
+
+        if let Some(latency_fd) = self.latency_map_fd {
+            // Read latency value from external map
+            let mut latency_value: u32 = 0;
+            let key = MAP_KEY.to_ne_bytes();
+            let value_ptr = &mut latency_value as *mut u32 as *mut libc::c_void;
+
+            let ret = unsafe {
+                libbpf_sys::bpf_map_lookup_elem(
+                    latency_fd,
+                    key.as_ptr() as *const libc::c_void,
+                    value_ptr,
+                )
+            };
+
+            if ret == 0 {
+                // // DEBUGING
+                // info!("Latency value: {} ns", latency_value);
+                
+                // Successfully read latency
+                let high_latency = latency_value > LATENCY_THRESHOLD_NS;
+
+                // Update high latency flag in BPF map
+                let flag_map = &self.skel.maps.high_latency_flag;
+                let flag_key = MAP_KEY.to_ne_bytes();
+                let flag_value: u8 = if high_latency { 1 } else { 0 };
+
+                flag_map
+                    .update(&flag_key, &flag_value.to_ne_bytes(), MapFlags::ANY)
+                    .context("Failed to update high latency flag")?;
+
+                if high_latency {
+                    info!("High latency detected: {} ns (threshold: {} ns)", 
+                          latency_value, LATENCY_THRESHOLD_NS);
+                }
+            } else {
+                // Failed to read latency map (might not exist yet or was closed)
+                // Silently continue - this is not critical
+            }
+        }
+
+        Ok(())
+    }
+
     fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
         let (res_ch, req_ch) = self.stats_server.channels();
         let now = Instant::now();
         let mut next_tune_at = now + self.tune_interval;
         let mut next_sched_at = now + self.sched_interval;
+        let mut next_latency_check = self.next_latency_check;
 
         self.skel.maps.stats.value_size() as usize;
 
@@ -659,9 +734,21 @@ impl<'a> Scheduler<'a> {
                 }
             }
 
+            // Check latency periodically
+            if now >= next_latency_check {
+                if let Err(e) = self.check_latency() {
+                    // Log error but don't fail - latency monitoring is optional
+                    log::warn!("Latency check failed: {}", e);
+                }
+                next_latency_check += self.latency_check_interval;
+                if next_latency_check < now {
+                    next_latency_check = now + self.latency_check_interval;
+                }
+            }
+
             self.time_used += Instant::now().duration_since(now);
 
-            match req_ch.recv_deadline(next_sched_at.min(next_tune_at)) {
+            match req_ch.recv_deadline(next_sched_at.min(next_tune_at).min(next_latency_check)) {
                 Ok(prev_sc) => {
                     let cur_sc = StatsCtx::new(&self.skel, &self.proc_reader, self.time_used)?;
                     let delta_sc = cur_sc.delta(&prev_sc);
@@ -673,6 +760,13 @@ impl<'a> Scheduler<'a> {
             }
         }
 
+        // Cleanup: close latency map FD if opened
+        if let Some(fd) = self.latency_map_fd.take() {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+
         let _ = self.struct_ops.take();
         uei_report!(&self.skel, uei)
     }
@@ -681,6 +775,13 @@ impl<'a> Scheduler<'a> {
 impl Drop for Scheduler<'_> {
     fn drop(&mut self) {
         info!("Unregister {SCHEDULER_NAME} scheduler");
+
+        // Close latency map FD if opened
+        if let Some(fd) = self.latency_map_fd.take() {
+            unsafe {
+                libc::close(fd);
+            }
+        }
 
         if let Some(struct_ops) = self.struct_ops.take() {
             drop(struct_ops);
