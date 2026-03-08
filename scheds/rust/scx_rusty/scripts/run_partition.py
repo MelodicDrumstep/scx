@@ -25,10 +25,9 @@ Num_total_cores = 40
 
 # Control policy parameters (adjust as needed)
 CONTROL_INTERVAL_SEC = 1.0
-SLO_TARGET_MS = 2.0
-PEAK_LC_LOAD = 1.0
+LC_P99_HIGH_MS = 2.5
+LC_P99_LOW_MS = 1.8
 LC_MIN_CORES = 1
-EXTRA_COOLDOWN_SEC = 3.0
 
 # We only use cores 0, 4, 8, 12 ... 36 (0x1111111111)
 CORE_MASK_HEX = "0x1111111111"
@@ -474,42 +473,31 @@ def run(
             print("Latency not available yet, skipping this interval.")
             continue
 
-        slack_ratio = (SLO_TARGET_MS - measured_latency_ms) / SLO_TARGET_MS
-        load_ratio = lc_load / PEAK_LC_LOAD if PEAK_LC_LOAD > 0 else lc_load
-
         print(
-            f"Latency source={latency_source}, p99={measured_latency_ms:.3f} ms, "
-            f"slack_ratio={slack_ratio:.3f}, load_ratio={load_ratio:.3f}, "
+            f"Latency source={latency_source}, p99={measured_latency_ms:.3f} ms "
+            f"(low={LC_P99_LOW_MS:.3f}, high={LC_P99_HIGH_MS:.3f}), "
+            f"LC_load={lc_load:.3f}, "
             f"LC_cores={lc_cores}, BE_cores={total_cores - lc_cores}",
         )
 
-        if load_ratio > 0.85:
-            lc_cores = total_cores
-            apply_core_partition(
-                lc_root_pid=lc_process.pid,
-                be_root_pid=be_process.pid,
-                lc_cores=lc_cores,
-                total_cores=total_cores,
-                available_cores=available_cores,
-            )
-            set_be_thread_count(total_cores - lc_cores)
-            continue
-
-        if slack_ratio < 0:
-            lc_cores = total_cores
-            apply_core_partition(
-                lc_root_pid=lc_process.pid,
-                be_root_pid=be_process.pid,
-                lc_cores=lc_cores,
-                total_cores=total_cores,
-                available_cores=available_cores,
-            )
-            set_be_thread_count(total_cores - lc_cores)
-            time.sleep(EXTRA_COOLDOWN_SEC)
-            continue
-
         be_cores = total_cores - lc_cores
-        if slack_ratio < 0.05:
+
+        # If LC latency is low, give one more core to BE.
+        if measured_latency_ms < LC_P99_LOW_MS:
+            if lc_cores > LC_MIN_CORES:
+                lc_cores = max(lc_cores - 1, LC_MIN_CORES)
+                apply_core_partition(
+                    lc_root_pid=lc_process.pid,
+                    be_root_pid=be_process.pid,
+                    lc_cores=lc_cores,
+                    total_cores=total_cores,
+                    available_cores=available_cores,
+                )
+                set_be_thread_count(total_cores - lc_cores)
+            continue
+
+        # If LC latency is high, give one more core to LC.
+        if measured_latency_ms > LC_P99_HIGH_MS:
             if be_cores > 0:
                 lc_cores = min(lc_cores + 1, total_cores)
                 apply_core_partition(
@@ -522,21 +510,8 @@ def run(
                 set_be_thread_count(total_cores - lc_cores)
             continue
 
-        if slack_ratio <= 0.20:
-            continue
-
-        if slack_ratio > 0.20:
-            if lc_cores > LC_MIN_CORES:
-                lc_cores = max(lc_cores - 1, LC_MIN_CORES)
-                apply_core_partition(
-                    lc_root_pid=lc_process.pid,
-                    be_root_pid=be_process.pid,
-                    lc_cores=lc_cores,
-                    total_cores=total_cores,
-                    available_cores=available_cores,
-                )
-                set_be_thread_count(total_cores - lc_cores)
-            continue
+        # Otherwise, keep the current partition.
+        continue
 
     print("All processes completed")
 
