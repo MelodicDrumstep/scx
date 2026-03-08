@@ -1,0 +1,478 @@
+import os
+import subprocess
+import signal
+import time
+import argparse
+import ctypes
+import ctypes.util
+import struct
+import threading
+from datetime import datetime
+from pathlib import Path
+
+# We only use cores 0, 4, 8, 12 ... 36 (0x1111111111)
+TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
+SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "470.lbm", "473.astar", "483.xalancbmk"]
+First_SMT_silibing_core_ID = 20 # Hard coded
+Num_total_cores = 40 # with SMT counted
+
+LATENCY_THRESHOLD_NS = 2000000 # 2ms
+
+def generate_even_string(x):
+    return ','.join(str(num) for num in range(0, x, 2))
+
+def generate_odd_string(x):
+    return ','.join(str(num) for num in range(1, x, 2))
+
+NUMA0_cores = generate_even_string(Num_total_cores)
+NUMA1_cores = generate_odd_string(Num_total_cores)
+
+# BPF map constants
+TASK_TYPE_RING_SIZE = 1024
+TASK_TYPE_LC = 0
+TASK_TYPE_BE = 1
+BPF_ANY = 0
+
+# Load libbpf
+libbpf = None
+libc = None
+
+def get_child_pids(pid):
+    """Get all child PIDs of a process"""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-P", str(pid)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        pids = [int(p) for p in result.stdout.strip().split('\n') if p]
+        return pids
+    except (subprocess.CalledProcessError, ValueError):
+        return []
+
+def get_descendant_pids(pid, max_depth=3):
+    """Get all descendant PIDs of a process (recursively)"""
+    pids = []
+    current_level = [pid]
+    
+    for depth in range(max_depth):
+        next_level = []
+        for parent_pid in current_level:
+            children = get_child_pids(parent_pid)
+            pids.extend(children)
+            next_level.extend(children)
+        current_level = next_level
+        if not current_level:
+            break
+    
+    return pids
+
+def get_all_thread_ids(pid):
+    """Get all thread IDs (TIDs) for a process, including the main thread"""
+    thread_ids = []
+    task_dir = f"/proc/{pid}/task"
+    
+    if not os.path.exists(task_dir):
+        return thread_ids
+    
+    try:
+        for tid_str in os.listdir(task_dir):
+            try:
+                tid = int(tid_str)
+                thread_ids.append(tid)
+            except ValueError:
+                continue
+    except (OSError, PermissionError):
+        pass
+    
+    return thread_ids
+
+def get_process_group_pids(pid):
+    """Get all PIDs in the same process group as the given PID"""
+    try:
+        pgid = os.getpgid(pid)
+        result = subprocess.run(
+            ["pgrep", "-g", str(pgid)],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            return [int(p) for p in result.stdout.strip().split('\n') if p]
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        pass
+    return []
+
+def get_all_threads_for_processes(pids):
+    """Get all thread IDs for a list of process PIDs"""
+    all_threads = []
+    for pid in pids:
+        threads = get_all_thread_ids(pid)
+        all_threads.extend(threads)
+        # Also include the PID itself (main thread TID == PID)
+        if pid not in all_threads:
+            all_threads.append(pid)
+    return all_threads
+
+def collect_and_write_be_threads(map_fd, be_process_pid, BE_type, debug_mode=False):
+    """One-time collect BE process threads and write them to the ring buffer (or print in debug mode)"""
+    try:
+        # Check if BE process is still running
+        if be_process_pid and os.path.exists(f"/proc/{be_process_pid}"):
+            be_pids = []
+            be_pids.append(be_process_pid)
+            
+            pgid_pids = get_process_group_pids(be_process_pid)
+            be_pids.extend(pgid_pids)
+
+            # For SPEC benchmarks, get descendants and find by name
+            descendant_pids = get_descendant_pids(be_process_pid, max_depth=5)
+            be_pids.extend(descendant_pids)
+            
+            # Get all threads for all BE processes
+            unique_be_pids = sorted(set(be_pids))
+            be_threads = get_all_threads_for_processes(unique_be_pids)
+            
+            if debug_mode:
+                # Debug mode: just print thread IDs with timestamp
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                print(f"[{timestamp}] DEBUG: BE Thread IDs ({len(be_threads)} total): {sorted(set(be_threads))}")
+            else:
+                # Normal mode: Write BE threads to ring buffer (one-time)
+                written_count = 0
+                failed_count = 0
+                for tid in set(be_threads):
+                    # Store the tid of the BE threads locally
+        else:
+            # BE process no longer exists
+            if debug_mode:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                print(f"[{timestamp}] DEBUG: BE process (PID {be_process_pid}) no longer exists")
+            else:
+                print(f"BE process (PID {be_process_pid}) no longer exists")
+            
+    except Exception as e:
+        if debug_mode:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            print(f"[{timestamp}] DEBUG: Error in BE thread collection: {e}")
+        else:
+            print(f"Error in BE thread collection: {e}")
+
+def kill_all_spec_processes():
+    """Kill all runspec and benchmark processes"""
+    commands = [
+        "sudo pkill -f runspec",
+        "sudo pkill -f specinvoke", 
+        "sudo pkill -f specmake",
+        "sudo pkill -f run_base"
+    ]
+    
+    for cmd in commands:
+        try:
+            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except:
+            pass
+    
+    print("Killed all SPEC processes")
+
+def collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode=False):
+    # Recursively collect and write BE process PIDs and sub-process PIDs to ring buffer (one-time)
+    if map_fd is not None or debug_mode:
+        # Wait for processes to start
+        time.sleep(1.5)
+        
+        if debug_mode:
+            print(f"\n[DEBUG MODE] Collecting BE process and sub-process PIDs...")
+        else:
+            print(f"\nCollecting BE process and sub-process PIDs...")
+        print(f"BE process PID: {be_process.pid}")
+        
+        # Collect BE PIDs recursively
+        be_pids = []
+        be_pids.append(be_process.pid)
+        
+        # Get process group PIDs
+        pgid_pids = get_process_group_pids(be_process.pid)
+        be_pids.extend(pgid_pids)
+        
+        # Get descendant PIDs recursively
+        descendant_pids = get_descendant_pids(be_process.pid, max_depth=5)
+        be_pids.extend(descendant_pids)
+        
+        # Get all unique BE PIDs
+        unique_be_pids = sorted(set(be_pids))
+        
+        # Get all threads for all BE processes
+        be_threads = get_all_threads_for_processes(unique_be_pids)
+        
+        if debug_mode:
+            # Debug mode: just print thread IDs
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            print(f"[{timestamp}] DEBUG: BE Process PIDs: {unique_be_pids}")
+            print(f"[{timestamp}] DEBUG: BE Thread IDs ({len(be_threads)} total): {sorted(set(be_threads))}")
+        else:
+            # Normal mode: Write BE threads to ring buffer (one-time)
+            written_count = 0
+            failed_count = 0
+            for tid in set(be_threads):
+                try:
+                    if write_task_type_update(map_fd, tid, TASK_TYPE_BE):
+                        written_count += 1
+                    else:
+                        failed_count += 1
+                except Exception as e:
+                    failed_count += 1
+                    print(f"  Error writing TID {tid} -> BE: {e}")
+            
+            print(f"Written BE task types: {written_count} written, {failed_count} failed (Total threads: {len(be_threads)})")
+            print(f"BE Process PIDs: {unique_be_pids}")
+            print(f"BE Thread IDs: {sorted(set(be_threads))}")
+
+def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None, debug_mode=False):
+    os.makedirs(LC_type, exist_ok=True)
+    os.makedirs(f"{LC_type}/{pressure}", exist_ok=True)
+    os.makedirs(f"{LC_type}/{pressure}/{BE_type}", exist_ok=True)
+
+    # Pressure level to number
+    if pressure == 'low':
+        pressure_num = 0.3
+    elif pressure == 'medium':
+        pressure_num = 0.5
+    elif pressure == 'high':
+        pressure_num = 0.7
+    else:
+        raise Exception("Invalid pressure level, only [low / medium / high] are supported")
+
+    # Masstree configuration
+    if LC_type == "masstree":
+        lats_bin = TailbenchDir / "masstree" / "lats.bin"
+        masstree_dir = TailbenchDir / "masstree"
+        QPS = int(11700 * pressure_num)
+        MAXREQS = QPS * 60
+        WARMUPREQS = QPS
+        MINSLEEPNS = 100
+        NTHREADS = os.environ.get("NTHREADS", "10")
+        
+        # Build taskset command based on num_cores or NUMA_unaware
+        taskset_cmd = ""
+        if num_cores:
+            # Use specified cores
+            cpu_list = ','.join(map(str, range(num_cores)))
+            taskset_cmd = f"taskset -c {cpu_list} "
+        elif NUMA_unaware:
+            # Use NUMA0 cores
+            taskset_cmd = f"taskset 0x1111111111 "
+        else:
+            # Use default CPU mask for even cores 0-38 (0x5555555555)
+            taskset_cmd = "taskset 0x1111111111 "
+        
+        # Construct masstree command with 10s sleep to allow scheduler to process ring buffer
+        LC_cmd = (
+            f"bash -c 'sleep 10 && cd {masstree_dir} && "
+            f"TBENCH_QPS={QPS} TBENCH_MAXREQS={MAXREQS} TBENCH_WARMUPREQS={WARMUPREQS} "
+            f"TBENCH_MINSLEEPNS={MINSLEEPNS} {taskset_cmd}"
+            f"./mttest_integrated -j{NTHREADS} mycsba masstree'"
+        )
+
+    elif LC_type == "specjbb":
+        lats_bin = TailbenchDir / "specjbb" / "lats.bin"
+        SPECJBB_DIR = TailbenchDir / "specjbb"
+        qps = 140000
+        run_sh = SPECJBB_DIR / "run.sh"
+        if not run_sh.exists():
+            print(f"ERROR: {run_sh} not found")
+            return False
+
+        # sleep 10s first
+        LC_cmd = (
+            f"bash -c 'sleep 10 && {run_sh} {qps}'"
+        )
+
+    # delete lats.bin if it exists
+    if lats_bin.exists():
+        os.remove(str(lats_bin))
+
+    # SPEC CPU environment - need to cd to directory and source shrc to set up Perl environment
+    spec_dir = os.path.expanduser("/home/dell-07/wltu/speccpu2006-v1.0.1")
+    
+    if num_cores:
+        # cd to spec directory, source shrc (sets up Perl @INC), then run runspec
+        # Add 10s sleep to allow scheduler to process ring buffer
+        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && taskset -c {First_SMT_silibing_core_ID}-{First_SMT_silibing_core_ID + num_cores - 1} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {num_cores} {BE_type}'"
+    elif NUMA_unaware:
+        # Add 10s sleep to allow scheduler to process ring buffer
+        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && taskset 0x1111111111 runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 4)} {BE_type}'"
+    else:
+        # Add 10s sleep to allow scheduler to process ring buffer
+        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores)} {BE_type}'"
+    # DEBUGING
+    # BE_cmd = "sleep 10000"
+
+    print(f"LC_cmd : {LC_cmd}, BE_cmd : {BE_cmd}")
+    # Start LC
+    print("Starting LC process...")
+    lc_process = None
+    try:
+        lc_process = subprocess.Popen(LC_cmd,
+                                    shell=True,
+                                    stdout=open(f"{LC_type}/{pressure}/{BE_type}/LC.log", "w"), 
+                                    stderr=subprocess.STDOUT)
+        print(f"LC process PID: {lc_process.pid}")
+    except Exception as e:
+        print(f"Error running LC process: {e}")
+
+    # Collect LC tid and write to the ring buffer
+    # Use grep 
+    lc_tid = get_all_thread_ids(lc_process.pid)
+    if map_fd is not None:
+        for tid in lc_tid:
+            # Store the tid of the LC threads locally
+        print(f"LC TID: {lc_tid}")
+
+    # LC will push p99 latency data to let latency_map_path = "/sys/fs/bpf/latency_map_path";
+    # We receive the p99 latency data here, and compare it with the threshold
+    # And we apply the corresponding partition policy using taskset command
+
+    # Start BE
+    print("Starting background processes (BE)...")
+    be_process = subprocess.Popen(BE_cmd,
+                                stdout=open(f"{LC_type}/{pressure}/{BE_type}/BE.log", "w"), 
+                                stderr=subprocess.STDOUT,
+                                shell=True,
+                                preexec_fn=os.setsid)
+
+    print(f"BE process PID: {be_process.pid}")
+
+    # One-time: collect and write BE process and sub-process PIDs to ring buffer
+    print("Collecting BE process and sub-process PIDs (one-time)...")
+    collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode)
+    
+    # Wait for LC process to complete
+    try:
+        while True:
+            if lc_process.poll() is not None:
+                print("LC process completed...")
+                break
+            time.sleep(1)
+        # Wait for LC process
+        if lc_process:
+            try:
+                lc_process.wait()
+                print("LC process completed")
+            except Exception as e:
+                print(f"Error waiting for LC process: {e}")
+    except Exception as e:
+        print(f"Error running LC process: {e}")
+    
+    print("All processes completed")
+    
+    # Cleanup - only terminate processes that are still running
+    print("Cleaning up...")
+    
+    # Check if LC process is still running and terminate it
+    if lc_process is not None:
+        try:
+            if lc_process.poll() is None:
+                print("LC process still running, terminating...")
+                lc_process.terminate()
+                try:
+                    lc_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    lc_process.kill()
+                    lc_process.wait()
+        except (ProcessLookupError, AttributeError):
+            pass
+    
+    # Check if BE process is still running and terminate it
+    try:
+        be_status = be_process.poll()
+        if be_status is None:
+            print("BE process still running, terminating...")
+            os.killpg(os.getpgid(be_process.pid), signal.SIGTERM)
+            try:
+                be_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(os.getpgid(be_process.pid), signal.SIGKILL)
+                be_process.wait()
+        else:
+            print(f"BE process already finished (status: {be_status})")
+    except (ProcessLookupError, AttributeError) as e:
+        print(f"Error checking BE process status: {e}")
+    
+    print("Extract latency from the log file...")
+    # Parse results
+    results_file = f"{LC_type}/{pressure}/{BE_type}/latency.log"
+    
+    if not lats_bin.exists():
+        print(f"WARNING: {lats_bin} not found after benchmark run")
+        exit(1)
+    
+    print(f"\nParsing latency results...")
+    parse_cmd = [
+        "python3",
+        str(TailbenchDir / "utilities" / "parselats.py"),
+        str(lats_bin)
+    ]
+    
+    try:
+        with open(results_file, 'w') as f:
+            parse_result = subprocess.run(
+                parse_cmd,
+                stdout=f,
+                stderr=subprocess.PIPE,
+                check=True,
+                text=True
+            )
+        print(f"Results saved to: {results_file}")
+    except subprocess.CalledProcessError as e:
+        print(f"ERROR: Failed to parse results")
+        print(f"Error: {e.stderr}")
+
+    # Kill SPEC processes
+    kill_all_spec_processes()
+
+    print("Execution completed")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(epilog = 'Usage : run_exp.py --LC <LC_type> [--BE <BE_type> / --run_all_SPEC] [-n <num_cores>]')
+    parser.add_argument('--LC', choices = ['masstree', 'specjbb'], help = 'The LC type')
+    parser.add_argument('--BE', choices = SPEC_2006_BE_list, help = 'The BE type')
+    parser.add_argument('--run_all_SPEC', action = 'store_true', help = 'To run all of the BE inside SPEC2006 one by one')
+    parser.add_argument('-n', '--num_cores', type = int, help = 'The number of cores to for LC and BE each. If not given, we won\'t bind cores.')
+    parser.add_argument('--NUMA_unaware', action = 'store_true', help = 'To only set one NUMA node, only needed when \"num_cores\" is not given.')
+    parser.add_argument('--task-type-shm', type = str, help = 'Path to the BPF map for task type ring buffer (e.g., /sys/fs/bpf/scx_rusty_task_types)')
+    parser.add_argument('--debug', action = 'store_true', help = 'Debug mode: print BE thread IDs with timestamps instead of writing to BPF map')
+    parser.add_argument('-p', '--pressure', type =str, choices = ['low', 'medium', 'high'], help = 'The pressure level to set for the LC process, [low / medium / high]')
+    args = parser.parse_args()
+
+    if args.pressure:
+        if args.pressure not in ['low', 'medium', 'high']:
+            raise Exception("Invalid pressure level, only [low / medium / high] are supported")
+        pressure = args.pressure
+    else:
+        raise Exception("Pressure level is not given")
+    
+    # num_cores == None means we do not bind cores
+    num_cores = None
+
+    if args.num_cores:
+        num_cores = args.num_cores
+        if args.NUMA_unaware:
+            raise Exception("\"NUMA_unaware\" is set but \"num_cores\" is also set, which is not valid")
+
+    if not args.LC:
+        raise Exception("No LC is given.")
+    LC_type = args.LC
+
+    if (not args.run_all_SPEC) and (not args.BE):
+        raise Exception("No BE is given.")
+
+    if args.run_all_SPEC:
+        if args.BE:
+            print("Warning : \"run all\" is set, ignoring given BE")
+        for BE_type in SPEC_2006_BE_list:
+            run(LC_type, BE_type, num_cores, args.NUMA_unaware, pressure, args.task_type_shm, args.debug)
+        exit()
+
+    run(LC_type, args.BE, num_cores, args.NUMA_unaware, pressure, args.task_type_shm, args.debug)
+    
