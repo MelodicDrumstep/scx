@@ -73,9 +73,9 @@ enum consts {
 };
 
 enum task_type {
-	TASK_TYPE_UNINITIALIZED = 1,
-	TASK_TYPE_LC = 2,
-	TASK_TYPE_BE = 3,
+	TASK_TYPE_UNINITIALIZED = -1,
+	TASK_TYPE_LC = 0,
+	TASK_TYPE_BE = 1,
 };
 
 struct task_type_entry {

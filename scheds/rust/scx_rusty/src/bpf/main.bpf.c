@@ -87,7 +87,7 @@ const volatile u32 greedy_threshold_x_numa;
 const volatile u32 rusty_perf_mode;
 const volatile u32 debug;
 
-const u32 BE_DISPATCH_PROB = 15; // 15% probability to check for BE task
+const u32 BE_DISPATCH_PROB = 50; // 50% probability to check for BE task
 
 /* base slice duration */
 volatile u64 slice_ns;

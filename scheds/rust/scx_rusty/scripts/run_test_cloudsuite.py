@@ -24,8 +24,8 @@ NUMA1_cores = generate_odd_string(Num_total_cores)
 
 # BPF map constants
 TASK_TYPE_RING_SIZE = 1024
-TASK_TYPE_LC = 2
-TASK_TYPE_BE = 3
+TASK_TYPE_LC = 0
+TASK_TYPE_BE = 1
 BPF_ANY = 0
 
 # Load libbpf

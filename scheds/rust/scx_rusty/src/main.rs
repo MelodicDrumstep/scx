@@ -570,7 +570,7 @@ impl<'a> Scheduler<'a> {
             stats_server,
 
             latency_map_fd,
-            latency_check_interval: Duration::from_millis(100), // Check every 100ms
+            latency_check_interval: Duration::from_millis(500), // Check every 500ms
             next_latency_check: Instant::now(),
         })
     }
@@ -660,7 +660,7 @@ impl<'a> Scheduler<'a> {
     }
 
     fn check_latency(&mut self) -> Result<()> {
-        const LATENCY_THRESHOLD_NS: u32 = 1500000;
+        const LATENCY_THRESHOLD_NS: u32 = 2000000;
         const MAP_KEY: u32 = 0;
 
         if let Some(latency_fd) = self.latency_map_fd {

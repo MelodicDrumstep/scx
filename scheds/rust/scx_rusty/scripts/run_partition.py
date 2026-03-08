@@ -26,7 +26,7 @@ Num_total_cores = 40
 # Control policy parameters (adjust as needed)
 CONTROL_INTERVAL_SEC = 1.0
 LC_P99_HIGH_MS = 2.5
-LC_P99_LOW_MS = 1.8
+LC_P99_LOW_MS = 2
 LC_MIN_CORES = 1
 
 # We only use cores 0, 4, 8, 12 ... 36 (0x1111111111)
