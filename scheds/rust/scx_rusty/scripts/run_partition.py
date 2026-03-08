@@ -3,61 +3,61 @@ import subprocess
 import signal
 import time
 import argparse
-import ctypes
-import ctypes.util
-import struct
-import threading
-from datetime import datetime
 from pathlib import Path
 
-# We only use cores 0, 4, 8, 12 ... 36 (0x1111111111)
 TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
-SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "470.lbm", "473.astar", "483.xalancbmk"]
-First_SMT_silibing_core_ID = 20 # Hard coded
-Num_total_cores = 40 # with SMT counted
+SPEC_2006_BE_list = [
+    "400.perlbench",
+    "401.bzip2",
+    "403.gcc",
+    "429.mcf",
+    "445.gobmk",
+    "456.hmmer",
+    "458.sjeng",
+    "462.libquantum",
+    "464.h264ref",
+    "470.lbm",
+    "473.astar",
+    "483.xalancbmk",
+]
+First_SMT_silibing_core_ID = 20
+Num_total_cores = 40
 
-LATENCY_THRESHOLD_NS = 2000000 # 2ms
+# Control policy parameters (adjust as needed)
+CONTROL_INTERVAL_SEC = 1.0
+SLO_TARGET_MS = 2.0
+PEAK_LC_LOAD = 1.0
+LC_MIN_CORES = 1
+EXTRA_COOLDOWN_SEC = 3.0
 
-def generate_even_string(x):
-    return ','.join(str(num) for num in range(0, x, 2))
+# We only use cores 0, 4, 8, 12 ... 36 (0x1111111111)
+CORE_MASK_HEX = "0x1111111111"
 
-def generate_odd_string(x):
-    return ','.join(str(num) for num in range(1, x, 2))
+DEFAULT_LATENCY_MAP_PATH = "/sys/fs/bpf/latency_map_path"
 
-NUMA0_cores = generate_even_string(Num_total_cores)
-NUMA1_cores = generate_odd_string(Num_total_cores)
+CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 
-# BPF map constants
-TASK_TYPE_RING_SIZE = 1024
-TASK_TYPE_LC = 0
-TASK_TYPE_BE = 1
-BPF_ANY = 0
 
-# Load libbpf
-libbpf = None
-libc = None
-
-def get_child_pids(pid):
-    """Get all child PIDs of a process"""
+def get_child_pids(pid: int) -> list[int]:
     try:
         result = subprocess.run(
             ["pgrep", "-P", str(pid)],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
         )
-        pids = [int(p) for p in result.stdout.strip().split('\n') if p]
+        pids = [int(p) for p in result.stdout.strip().split("\n") if p]
         return pids
     except (subprocess.CalledProcessError, ValueError):
         return []
 
-def get_descendant_pids(pid, max_depth=3):
-    """Get all descendant PIDs of a process (recursively)"""
-    pids = []
+
+def get_descendant_pids(pid: int, max_depth: int = 3) -> list[int]:
+    pids: list[int] = []
     current_level = [pid]
-    
-    for depth in range(max_depth):
-        next_level = []
+
+    for _ in range(max_depth):
+        next_level: list[int] = []
         for parent_pid in current_level:
             children = get_child_pids(parent_pid)
             pids.extend(children)
@@ -65,17 +65,17 @@ def get_descendant_pids(pid, max_depth=3):
         current_level = next_level
         if not current_level:
             break
-    
+
     return pids
 
-def get_all_thread_ids(pid):
-    """Get all thread IDs (TIDs) for a process, including the main thread"""
-    thread_ids = []
+
+def get_all_thread_ids(pid: int) -> list[int]:
+    thread_ids: list[int] = []
     task_dir = f"/proc/{pid}/task"
-    
+
     if not os.path.exists(task_dir):
         return thread_ids
-    
+
     try:
         for tid_str in os.listdir(task_dir):
             try:
@@ -85,165 +85,266 @@ def get_all_thread_ids(pid):
                 continue
     except (OSError, PermissionError):
         pass
-    
+
     return thread_ids
 
-def get_process_group_pids(pid):
-    """Get all PIDs in the same process group as the given PID"""
+
+def get_process_group_pids(pid: int) -> list[int]:
     try:
         pgid = os.getpgid(pid)
         result = subprocess.run(
             ["pgrep", "-g", str(pgid)],
             capture_output=True,
-            text=True
+            text=True,
         )
         if result.returncode == 0:
-            return [int(p) for p in result.stdout.strip().split('\n') if p]
+            return [int(p) for p in result.stdout.strip().split("\n") if p]
     except (OSError, ValueError, subprocess.CalledProcessError):
         pass
     return []
 
-def get_all_threads_for_processes(pids):
-    """Get all thread IDs for a list of process PIDs"""
-    all_threads = []
+
+def get_all_threads_for_processes(pids: list[int]) -> list[int]:
+    all_threads: list[int] = []
     for pid in pids:
         threads = get_all_thread_ids(pid)
         all_threads.extend(threads)
-        # Also include the PID itself (main thread TID == PID)
         if pid not in all_threads:
             all_threads.append(pid)
     return all_threads
 
-def collect_and_write_be_threads(map_fd, be_process_pid, BE_type, debug_mode=False):
-    """One-time collect BE process threads and write them to the ring buffer (or print in debug mode)"""
-    try:
-        # Check if BE process is still running
-        if be_process_pid and os.path.exists(f"/proc/{be_process_pid}"):
-            be_pids = []
-            be_pids.append(be_process_pid)
-            
-            pgid_pids = get_process_group_pids(be_process_pid)
-            be_pids.extend(pgid_pids)
-
-            # For SPEC benchmarks, get descendants and find by name
-            descendant_pids = get_descendant_pids(be_process_pid, max_depth=5)
-            be_pids.extend(descendant_pids)
-            
-            # Get all threads for all BE processes
-            unique_be_pids = sorted(set(be_pids))
-            be_threads = get_all_threads_for_processes(unique_be_pids)
-            
-            if debug_mode:
-                # Debug mode: just print thread IDs with timestamp
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                print(f"[{timestamp}] DEBUG: BE Thread IDs ({len(be_threads)} total): {sorted(set(be_threads))}")
-            else:
-                # Normal mode: Write BE threads to ring buffer (one-time)
-                written_count = 0
-                failed_count = 0
-                for tid in set(be_threads):
-                    # Store the tid of the BE threads locally
-        else:
-            # BE process no longer exists
-            if debug_mode:
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                print(f"[{timestamp}] DEBUG: BE process (PID {be_process_pid}) no longer exists")
-            else:
-                print(f"BE process (PID {be_process_pid}) no longer exists")
-            
-    except Exception as e:
-        if debug_mode:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            print(f"[{timestamp}] DEBUG: Error in BE thread collection: {e}")
-        else:
-            print(f"Error in BE thread collection: {e}")
 
 def kill_all_spec_processes():
-    """Kill all runspec and benchmark processes"""
     commands = [
         "sudo pkill -f runspec",
-        "sudo pkill -f specinvoke", 
+        "sudo pkill -f specinvoke",
         "sudo pkill -f specmake",
-        "sudo pkill -f run_base"
+        "sudo pkill -f run_base",
     ]
-    
+
     for cmd in commands:
         try:
             subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except:
+        except Exception:
             pass
-    
+
     print("Killed all SPEC processes")
 
-def collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode=False):
-    # Recursively collect and write BE process PIDs and sub-process PIDs to ring buffer (one-time)
-    if map_fd is not None or debug_mode:
-        # Wait for processes to start
-        time.sleep(1.5)
-        
-        if debug_mode:
-            print(f"\n[DEBUG MODE] Collecting BE process and sub-process PIDs...")
-        else:
-            print(f"\nCollecting BE process and sub-process PIDs...")
-        print(f"BE process PID: {be_process.pid}")
-        
-        # Collect BE PIDs recursively
-        be_pids = []
-        be_pids.append(be_process.pid)
-        
-        # Get process group PIDs
-        pgid_pids = get_process_group_pids(be_process.pid)
-        be_pids.extend(pgid_pids)
-        
-        # Get descendant PIDs recursively
-        descendant_pids = get_descendant_pids(be_process.pid, max_depth=5)
-        be_pids.extend(descendant_pids)
-        
-        # Get all unique BE PIDs
-        unique_be_pids = sorted(set(be_pids))
-        
-        # Get all threads for all BE processes
-        be_threads = get_all_threads_for_processes(unique_be_pids)
-        
-        if debug_mode:
-            # Debug mode: just print thread IDs
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-            print(f"[{timestamp}] DEBUG: BE Process PIDs: {unique_be_pids}")
-            print(f"[{timestamp}] DEBUG: BE Thread IDs ({len(be_threads)} total): {sorted(set(be_threads))}")
-        else:
-            # Normal mode: Write BE threads to ring buffer (one-time)
-            written_count = 0
-            failed_count = 0
-            for tid in set(be_threads):
-                try:
-                    if write_task_type_update(map_fd, tid, TASK_TYPE_BE):
-                        written_count += 1
-                    else:
-                        failed_count += 1
-                except Exception as e:
-                    failed_count += 1
-                    print(f"  Error writing TID {tid} -> BE: {e}")
-            
-            print(f"Written BE task types: {written_count} written, {failed_count} failed (Total threads: {len(be_threads)})")
-            print(f"BE Process PIDs: {unique_be_pids}")
-            print(f"BE Thread IDs: {sorted(set(be_threads))}")
 
-def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None, debug_mode=False):
+def get_available_cores_from_mask(mask_hex: str, max_core: int) -> list[int]:
+    mask = int(mask_hex, 16)
+    cores: list[int] = []
+    for cpu in range(max_core):
+        if mask & (1 << cpu):
+            cores.append(cpu)
+    return cores
+
+
+def set_cpuset_for_threads(pids: list[int], cores: list[int]):
+    if not cores:
+        return
+    core_set = set(cores)
+    for pid in pids:
+        try:
+            os.sched_setaffinity(pid, core_set)
+            for tid in get_all_thread_ids(pid):
+                try:
+                    os.sched_setaffinity(tid, core_set)
+                except (ProcessLookupError, PermissionError, OSError):
+                    continue
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+
+
+def apply_core_partition(
+    lc_root_pid: int,
+    be_root_pid: int | None,
+    lc_cores: int,
+    total_cores: int,
+    available_cores: list[int],
+):
+    lc_cores = max(1, min(lc_cores, total_cores))
+    be_cores = total_cores - lc_cores
+
+    lc_core_list = available_cores[:lc_cores]
+    be_core_list = available_cores[lc_cores:]
+
+    lc_pids: list[int] = [lc_root_pid]
+    lc_pids.extend(get_process_group_pids(lc_root_pid))
+    lc_pids.extend(get_descendant_pids(lc_root_pid, max_depth=5))
+    lc_pids = sorted(set(lc_pids))
+
+    be_pids: list[int] = []
+    if be_root_pid is not None:
+        be_pids.append(be_root_pid)
+        be_pids.extend(get_process_group_pids(be_root_pid))
+        be_pids.extend(get_descendant_pids(be_root_pid, max_depth=5))
+        be_pids = sorted(set(be_pids))
+
+    set_cpuset_for_threads(lc_pids, lc_core_list)
+
+    if be_pids:
+        if be_cores == 0:
+            for pid in be_pids:
+                try:
+                    os.kill(pid, signal.SIGSTOP)
+                except ProcessLookupError:
+                    continue
+        else:
+            for pid in be_pids:
+                try:
+                    os.kill(pid, signal.SIGCONT)
+                except ProcessLookupError:
+                    continue
+            set_cpuset_for_threads(be_pids, be_core_list)
+
+    print(
+        f"Applied core partition: LC cores={lc_core_list}, "
+        f"BE cores={be_core_list}",
+    )
+
+def set_be_thread_count(be_cores: int):
+    print(f"Target BE thread/worker count ~ {be_cores}")
+
+def measure_lc_tail_latency_ms_from_bpf_map(latency_map_path: str) -> float | None:
+    """
+    Read newest LC p99 latency from a pinned BPF map.
+
+    Assumption (matching `scx_rusty/src/main.rs`): map stores a single u32 latency value
+    (nanoseconds) at key 0.
+    """
+    if not latency_map_path or not os.path.exists(latency_map_path):
+        return None
+
+    cmd = [
+        "sudo",
+        "bpftool",
+        "map",
+        "lookup",
+        "pinned",
+        latency_map_path,
+        "key",
+        "0",
+        "0",
+        "0",
+        "0",
+    ]
+
+    try:
+        res = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        err = getattr(e, "stderr", None)
+        if err:
+            print(f"Failed to read latency map via bpftool: {err.strip()}")
+        else:
+            print("Failed to read latency map via bpftool")
+        return None
+
+    out = res.stdout.strip().replace("\n", " ")
+    if "value:" not in out:
+        return None
+
+    value_part = out.split("value:", 1)[1].strip()
+    hex_bytes: list[str] = []
+    for tok in value_part.split():
+        if len(tok) == 2 and all(c in "0123456789abcdefABCDEF" for c in tok):
+            hex_bytes.append(tok)
+        else:
+            break
+
+    if len(hex_bytes) < 4:
+        return None
+
+    raw = bytes(int(b, 16) for b in hex_bytes[:4])
+    ns = int.from_bytes(raw, byteorder="little", signed=False)
+
+    ms = ns / 1e6
+    print(
+        f"[DEBUG] BPF latency map {latency_map_path}: "
+        f"p99={ns} ns ({ms:.3f} ms)"
+    )
+    return ms
+
+
+def read_thread_cpu_time(tid: int) -> int | None:
+    stat_path = f"/proc/{tid}/stat"
+    try:
+        with open(stat_path, "r") as f:
+            data = f.read().split()
+        utime = int(data[13])
+        stime = int(data[14])
+        return utime + stime
+    except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError, ValueError):
+        return None
+
+
+def measure_lc_load(
+    lc_root_pid: int,
+    total_cores: int,
+    last_cpu_times: dict[int, int],
+    interval_sec: float,
+) -> tuple[float, dict[int, int]]:
+    lc_pids: list[int] = [lc_root_pid]
+    lc_pids.extend(get_process_group_pids(lc_root_pid))
+    lc_pids.extend(get_descendant_pids(lc_root_pid, max_depth=5))
+    lc_pids = sorted(set(lc_pids))
+
+    tids: list[int] = []
+    for pid in lc_pids:
+        tids.append(pid)
+        tids.extend(get_all_thread_ids(pid))
+
+    new_cpu_times: dict[int, int] = {}
+    delta_ticks_total = 0
+
+    for tid in set(tids):
+        t = read_thread_cpu_time(tid)
+        if t is None:
+            continue
+        new_cpu_times[tid] = t
+        prev = last_cpu_times.get(tid)
+        if prev is not None and t >= prev:
+            delta_ticks_total += t - prev
+
+    if interval_sec <= 0 or total_cores <= 0:
+        return 0.0, new_cpu_times
+
+    cpu_seconds = delta_ticks_total / float(CLK_TCK)
+    capacity_seconds = interval_sec * float(total_cores)
+
+    load_ratio = cpu_seconds / capacity_seconds if capacity_seconds > 0 else 0.0
+    load_ratio = max(0.0, min(load_ratio, 1.5))
+
+    return load_ratio, new_cpu_times
+
+
+def run(
+    LC_type: str,
+    BE_type: str,
+    num_cores: int | None,
+    NUMA_unaware: bool,
+    pressure: str,
+    latency_map_path: str,
+):
     os.makedirs(LC_type, exist_ok=True)
     os.makedirs(f"{LC_type}/{pressure}", exist_ok=True)
     os.makedirs(f"{LC_type}/{pressure}/{BE_type}", exist_ok=True)
 
-    # Pressure level to number
-    if pressure == 'low':
+    if pressure == "low":
         pressure_num = 0.3
-    elif pressure == 'medium':
+    elif pressure == "medium":
         pressure_num = 0.5
-    elif pressure == 'high':
+    elif pressure == "high":
         pressure_num = 0.7
     else:
         raise Exception("Invalid pressure level, only [low / medium / high] are supported")
 
-    # Masstree configuration
     if LC_type == "masstree":
         lats_bin = TailbenchDir / "masstree" / "lats.bin"
         masstree_dir = TailbenchDir / "masstree"
@@ -252,21 +353,16 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
         WARMUPREQS = QPS
         MINSLEEPNS = 100
         NTHREADS = os.environ.get("NTHREADS", "10")
-        
-        # Build taskset command based on num_cores or NUMA_unaware
+
         taskset_cmd = ""
         if num_cores:
-            # Use specified cores
-            cpu_list = ','.join(map(str, range(num_cores)))
+            cpu_list = ",".join(map(str, range(num_cores)))
             taskset_cmd = f"taskset -c {cpu_list} "
         elif NUMA_unaware:
-            # Use NUMA0 cores
-            taskset_cmd = f"taskset 0x1111111111 "
+            taskset_cmd = f"taskset {CORE_MASK_HEX} "
         else:
-            # Use default CPU mask for even cores 0-38 (0x5555555555)
-            taskset_cmd = "taskset 0x1111111111 "
-        
-        # Construct masstree command with 10s sleep to allow scheduler to process ring buffer
+            taskset_cmd = f"taskset {CORE_MASK_HEX} "
+
         LC_cmd = (
             f"bash -c 'sleep 10 && cd {masstree_dir} && "
             f"TBENCH_QPS={QPS} TBENCH_MAXREQS={MAXREQS} TBENCH_WARMUPREQS={WARMUPREQS} "
@@ -283,93 +379,169 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
             print(f"ERROR: {run_sh} not found")
             return False
 
-        # sleep 10s first
-        LC_cmd = (
-            f"bash -c 'sleep 10 && {run_sh} {qps}'"
-        )
+        LC_cmd = f"bash -c 'sleep 10 && {run_sh} {qps}'"
 
-    # delete lats.bin if it exists
+    else:
+        raise Exception("Unsupported LC_type")
+
     if lats_bin.exists():
         os.remove(str(lats_bin))
 
-    # SPEC CPU environment - need to cd to directory and source shrc to set up Perl environment
     spec_dir = os.path.expanduser("/home/dell-07/wltu/speccpu2006-v1.0.1")
-    
+
     if num_cores:
-        # cd to spec directory, source shrc (sets up Perl @INC), then run runspec
-        # Add 10s sleep to allow scheduler to process ring buffer
-        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && taskset -c {First_SMT_silibing_core_ID}-{First_SMT_silibing_core_ID + num_cores - 1} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {num_cores} {BE_type}'"
+        BE_cmd = (
+            f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && "
+            f"taskset -c {First_SMT_silibing_core_ID}-{First_SMT_silibing_core_ID + num_cores - 1} "
+            f"runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {num_cores} {BE_type}'"
+        )
     elif NUMA_unaware:
-        # Add 10s sleep to allow scheduler to process ring buffer
-        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && taskset 0x1111111111 runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 4)} {BE_type}'"
+        BE_cmd = (
+            f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && "
+            f"taskset {CORE_MASK_HEX} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 4)} {BE_type}'"
+        )
     else:
-        # Add 10s sleep to allow scheduler to process ring buffer
-        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores)} {BE_type}'"
-    # DEBUGING
-    # BE_cmd = "sleep 10000"
+        BE_cmd = (
+            f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && "
+            f"runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores)} {BE_type}'"
+        )
 
     print(f"LC_cmd : {LC_cmd}, BE_cmd : {BE_cmd}")
-    # Start LC
+
     print("Starting LC process...")
     lc_process = None
     try:
-        lc_process = subprocess.Popen(LC_cmd,
-                                    shell=True,
-                                    stdout=open(f"{LC_type}/{pressure}/{BE_type}/LC.log", "w"), 
-                                    stderr=subprocess.STDOUT)
+        lc_process = subprocess.Popen(
+            LC_cmd,
+            shell=True,
+            stdout=open(f"{LC_type}/{pressure}/{BE_type}/LC.log", "w"),
+            stderr=subprocess.STDOUT,
+        )
         print(f"LC process PID: {lc_process.pid}")
     except Exception as e:
         print(f"Error running LC process: {e}")
+        return
 
-    # Collect LC tid and write to the ring buffer
-    # Use grep 
-    lc_tid = get_all_thread_ids(lc_process.pid)
-    if map_fd is not None:
-        for tid in lc_tid:
-            # Store the tid of the LC threads locally
-        print(f"LC TID: {lc_tid}")
-
-    # LC will push p99 latency data to let latency_map_path = "/sys/fs/bpf/latency_map_path";
-    # We receive the p99 latency data here, and compare it with the threshold
-    # And we apply the corresponding partition policy using taskset command
-
-    # Start BE
     print("Starting background processes (BE)...")
-    be_process = subprocess.Popen(BE_cmd,
-                                stdout=open(f"{LC_type}/{pressure}/{BE_type}/BE.log", "w"), 
-                                stderr=subprocess.STDOUT,
-                                shell=True,
-                                preexec_fn=os.setsid)
+    be_process = subprocess.Popen(
+        BE_cmd,
+        stdout=open(f"{LC_type}/{pressure}/{BE_type}/BE.log", "w"),
+        stderr=subprocess.STDOUT,
+        shell=True,
+        preexec_fn=os.setsid,
+    )
 
     print(f"BE process PID: {be_process.pid}")
 
-    # One-time: collect and write BE process and sub-process PIDs to ring buffer
-    print("Collecting BE process and sub-process PIDs (one-time)...")
-    collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode)
-    
-    # Wait for LC process to complete
-    try:
-        while True:
-            if lc_process.poll() is not None:
-                print("LC process completed...")
-                break
-            time.sleep(1)
-        # Wait for LC process
-        if lc_process:
-            try:
-                lc_process.wait()
-                print("LC process completed")
-            except Exception as e:
-                print(f"Error waiting for LC process: {e}")
-    except Exception as e:
-        print(f"Error running LC process: {e}")
-    
+    available_cores = get_available_cores_from_mask(CORE_MASK_HEX, Num_total_cores)
+    total_cores = len(available_cores)
+
+    lc_cores = total_cores
+    last_cpu_times: dict[int, int] = {}
+
+    apply_core_partition(
+        lc_root_pid=lc_process.pid,
+        be_root_pid=be_process.pid,
+        lc_cores=lc_cores,
+        total_cores=total_cores,
+        available_cores=available_cores,
+    )
+    set_be_thread_count(total_cores - lc_cores)
+
+    print("Entering control loop for core partitioning...")
+
+    while True:
+        if lc_process.poll() is not None:
+            print("LC process completed, exiting control loop...")
+            break
+
+        time.sleep(CONTROL_INTERVAL_SEC)
+
+        latency_source = "none"
+        measured_latency_ms = measure_lc_tail_latency_ms_from_bpf_map(latency_map_path)
+        if measured_latency_ms is not None:
+            latency_source = "bpf_map"
+        else:
+            raise Exception("Latency not available yet, skipping this interval.")
+        lc_load, last_cpu_times = measure_lc_load(
+            lc_root_pid=lc_process.pid,
+            total_cores=total_cores,
+            last_cpu_times=last_cpu_times,
+            interval_sec=CONTROL_INTERVAL_SEC,
+        )
+
+        if measured_latency_ms is None:
+            print("Latency not available yet, skipping this interval.")
+            continue
+
+        slack_ratio = (SLO_TARGET_MS - measured_latency_ms) / SLO_TARGET_MS
+        load_ratio = lc_load / PEAK_LC_LOAD if PEAK_LC_LOAD > 0 else lc_load
+
+        print(
+            f"Latency source={latency_source}, p99={measured_latency_ms:.3f} ms, "
+            f"slack_ratio={slack_ratio:.3f}, load_ratio={load_ratio:.3f}, "
+            f"LC_cores={lc_cores}, BE_cores={total_cores - lc_cores}",
+        )
+
+        if load_ratio > 0.85:
+            lc_cores = total_cores
+            apply_core_partition(
+                lc_root_pid=lc_process.pid,
+                be_root_pid=be_process.pid,
+                lc_cores=lc_cores,
+                total_cores=total_cores,
+                available_cores=available_cores,
+            )
+            set_be_thread_count(total_cores - lc_cores)
+            continue
+
+        if slack_ratio < 0:
+            lc_cores = total_cores
+            apply_core_partition(
+                lc_root_pid=lc_process.pid,
+                be_root_pid=be_process.pid,
+                lc_cores=lc_cores,
+                total_cores=total_cores,
+                available_cores=available_cores,
+            )
+            set_be_thread_count(total_cores - lc_cores)
+            time.sleep(EXTRA_COOLDOWN_SEC)
+            continue
+
+        be_cores = total_cores - lc_cores
+        if slack_ratio < 0.05:
+            if be_cores > 0:
+                lc_cores = min(lc_cores + 1, total_cores)
+                apply_core_partition(
+                    lc_root_pid=lc_process.pid,
+                    be_root_pid=be_process.pid,
+                    lc_cores=lc_cores,
+                    total_cores=total_cores,
+                    available_cores=available_cores,
+                )
+                set_be_thread_count(total_cores - lc_cores)
+            continue
+
+        if slack_ratio <= 0.20:
+            continue
+
+        if slack_ratio > 0.20:
+            if lc_cores > LC_MIN_CORES:
+                lc_cores = max(lc_cores - 1, LC_MIN_CORES)
+                apply_core_partition(
+                    lc_root_pid=lc_process.pid,
+                    be_root_pid=be_process.pid,
+                    lc_cores=lc_cores,
+                    total_cores=total_cores,
+                    available_cores=available_cores,
+                )
+                set_be_thread_count(total_cores - lc_cores)
+            continue
+
     print("All processes completed")
-    
-    # Cleanup - only terminate processes that are still running
+
     print("Cleaning up...")
-    
-    # Check if LC process is still running and terminate it
+
     if lc_process is not None:
         try:
             if lc_process.poll() is None:
@@ -382,8 +554,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
                     lc_process.wait()
         except (ProcessLookupError, AttributeError):
             pass
-    
-    # Check if BE process is still running and terminate it
+
     try:
         be_status = be_process.poll()
         if be_status is None:
@@ -398,67 +569,91 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
             print(f"BE process already finished (status: {be_status})")
     except (ProcessLookupError, AttributeError) as e:
         print(f"Error checking BE process status: {e}")
-    
+
     print("Extract latency from the log file...")
-    # Parse results
+
     results_file = f"{LC_type}/{pressure}/{BE_type}/latency.log"
-    
+
     if not lats_bin.exists():
         print(f"WARNING: {lats_bin} not found after benchmark run")
         exit(1)
-    
-    print(f"\nParsing latency results...")
+
+    print("\nParsing latency results...")
     parse_cmd = [
         "python3",
         str(TailbenchDir / "utilities" / "parselats.py"),
-        str(lats_bin)
+        str(lats_bin),
     ]
-    
+
     try:
-        with open(results_file, 'w') as f:
-            parse_result = subprocess.run(
+        with open(results_file, "w") as f:
+            subprocess.run(
                 parse_cmd,
                 stdout=f,
                 stderr=subprocess.PIPE,
                 check=True,
-                text=True
+                text=True,
             )
         print(f"Results saved to: {results_file}")
     except subprocess.CalledProcessError as e:
-        print(f"ERROR: Failed to parse results")
+        print("ERROR: Failed to parse results")
         print(f"Error: {e.stderr}")
 
-    # Kill SPEC processes
     kill_all_spec_processes()
 
     print("Execution completed")
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(epilog = 'Usage : run_exp.py --LC <LC_type> [--BE <BE_type> / --run_all_SPEC] [-n <num_cores>]')
-    parser.add_argument('--LC', choices = ['masstree', 'specjbb'], help = 'The LC type')
-    parser.add_argument('--BE', choices = SPEC_2006_BE_list, help = 'The BE type')
-    parser.add_argument('--run_all_SPEC', action = 'store_true', help = 'To run all of the BE inside SPEC2006 one by one')
-    parser.add_argument('-n', '--num_cores', type = int, help = 'The number of cores to for LC and BE each. If not given, we won\'t bind cores.')
-    parser.add_argument('--NUMA_unaware', action = 'store_true', help = 'To only set one NUMA node, only needed when \"num_cores\" is not given.')
-    parser.add_argument('--task-type-shm', type = str, help = 'Path to the BPF map for task type ring buffer (e.g., /sys/fs/bpf/scx_rusty_task_types)')
-    parser.add_argument('--debug', action = 'store_true', help = 'Debug mode: print BE thread IDs with timestamps instead of writing to BPF map')
-    parser.add_argument('-p', '--pressure', type =str, choices = ['low', 'medium', 'high'], help = 'The pressure level to set for the LC process, [low / medium / high]')
+    parser = argparse.ArgumentParser(
+        epilog='Usage : run_partition.py --LC <LC_type> [--BE <BE_type> / --run_all_SPEC] [-n <num_cores>]',
+    )
+    parser.add_argument("--LC", choices=["masstree", "specjbb"], help="The LC type")
+    parser.add_argument("--BE", choices=SPEC_2006_BE_list, help="The BE type")
+    parser.add_argument(
+        "--run_all_SPEC",
+        action="store_true",
+        help="To run all of the BE inside SPEC2006 one by one",
+    )
+    parser.add_argument(
+        "-n",
+        "--num_cores",
+        type=int,
+        help="The number of cores to for LC and BE each. If not given, we will not bind LC/BE by core count.",
+    )
+    parser.add_argument(
+        "--NUMA_unaware",
+        action="store_true",
+        help='To only set one NUMA node, only needed when "num_cores" is not given.',
+    )
+    parser.add_argument(
+        "-p",
+        "--pressure",
+        type=str,
+        choices=["low", "medium", "high"],
+        help="The pressure level to set for the LC process, [low / medium / high]",
+    )
+    parser.add_argument(
+        "--latency-map-path",
+        type=str,
+        default=DEFAULT_LATENCY_MAP_PATH,
+        help='Pinned BPF map path that stores newest LC p99 latency (ns), e.g. "/sys/fs/bpf/latency_map_path"',
+    )
     args = parser.parse_args()
 
     if args.pressure:
-        if args.pressure not in ['low', 'medium', 'high']:
+        if args.pressure not in ["low", "medium", "high"]:
             raise Exception("Invalid pressure level, only [low / medium / high] are supported")
         pressure = args.pressure
     else:
         raise Exception("Pressure level is not given")
-    
-    # num_cores == None means we do not bind cores
-    num_cores = None
+
+    num_cores: int | None = None
 
     if args.num_cores:
         num_cores = args.num_cores
-        if args.NUMA_unaware:
-            raise Exception("\"NUMA_unaware\" is set but \"num_cores\" is also set, which is not valid")
+        if args.NUMA_unaware and num_cores is not None:
+            raise Exception('"NUMA_unaware" is set but "num_cores" is also set, which is not valid')
 
     if not args.LC:
         raise Exception("No LC is given.")
@@ -469,10 +664,10 @@ if __name__ == "__main__":
 
     if args.run_all_SPEC:
         if args.BE:
-            print("Warning : \"run all\" is set, ignoring given BE")
+            print('Warning : "run all" is set, ignoring given BE')
         for BE_type in SPEC_2006_BE_list:
-            run(LC_type, BE_type, num_cores, args.NUMA_unaware, pressure, args.task_type_shm, args.debug)
+            run(LC_type, BE_type, num_cores, args.NUMA_unaware, pressure, args.latency_map_path)
         exit()
 
-    run(LC_type, args.BE, num_cores, args.NUMA_unaware, pressure, args.task_type_shm, args.debug)
+    run(LC_type, args.BE, num_cores, args.NUMA_unaware, pressure, args.latency_map_path)
     
