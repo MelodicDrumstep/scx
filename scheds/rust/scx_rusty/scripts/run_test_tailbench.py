@@ -375,6 +375,89 @@ def collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_
             print(f"BE Process PIDs: {unique_be_pids}")
             print(f"BE Thread IDs: {sorted(set(be_threads))}")
 
+def read_thread_cpu_time(tid: int) -> int | None:
+    stat_path = f"/proc/{tid}/stat"
+    try:
+        with open(stat_path, "r") as f:
+            data = f.read().split()
+        utime = int(data[13])
+        stime = int(data[14])
+        return utime + stime
+    except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError, ValueError):
+        return None
+
+
+def start_be_throughput_monitor(be_pid: int):
+    """
+    Start a best-effort `perf stat` monitor for BE instructions.
+
+    We use `--all-child` so forked children are accounted for. Output is CSV so we can parse it.
+    Returns (perf_process, start_time_monotonic) or (None, start_time_monotonic) on failure.
+    """
+    start_time = time.monotonic()
+    cmd = [
+        "sudo",
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions",
+        "-p",
+        str(be_pid),
+    ]
+    try:
+        perf_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        print(f"[DEBUG] Started perf monitor for BE PID {be_pid}")
+        return perf_proc, start_time
+    except FileNotFoundError:
+        print("Warning: `perf` not found; BE throughput will not be measured.")
+        return None, start_time
+    except Exception as e:
+        print(f"Warning: failed to start `perf stat` for BE throughput: {e}")
+        return None, start_time
+
+
+def parse_perf_stat_csv(stderr_text: str) -> tuple[int | None, float | None]:
+    """
+    Parse `perf stat -x,` stderr output.
+    Returns (instructions, seconds_elapsed).
+    """
+    instructions: int | None = None
+    seconds_elapsed: float | None = None
+
+    for line in stderr_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+
+        value_str = parts[0].replace(" ", "").replace("<notcounted>", "").replace("<not-supported>", "")
+        event = parts[1]
+
+        if event == "instructions":
+            # value can be like "1,234,567" or "1234567" depending on locale; normalize.
+            v = parts[0].replace(",", "").strip()
+            try:
+                instructions = int(float(v))
+            except ValueError:
+                continue
+
+        if "seconds time elapsed" in line:
+            v = parts[0].replace(",", "").strip()
+            try:
+                seconds_elapsed = float(v)
+            except ValueError:
+                continue
+
+    return instructions, seconds_elapsed
+
 def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None, debug_mode=False):
     os.makedirs(LC_type, exist_ok=True)
     os.makedirs(f"{LC_type}/{pressure}", exist_ok=True)
@@ -522,6 +605,8 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
 
     print(f"BE process PID: {be_process.pid}")
 
+    perf_proc, be_start_time = start_be_throughput_monitor(be_process.pid)
+
     # One-time: collect and write BE process and sub-process PIDs to ring buffer
     print("Collecting BE process and sub-process PIDs (one-time)...")
     collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode)
@@ -577,6 +662,56 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
             print(f"BE process already finished (status: {be_status})")
     except (ProcessLookupError, AttributeError) as e:
         print(f"Error checking BE process status: {e}")
+
+    # Stop perf monitor and report BE throughput.
+    perf_stderr = ""
+    if perf_proc is not None:
+        try:
+            if perf_proc.poll() is None:
+                perf_proc.send_signal(signal.SIGINT)
+            perf_stderr = perf_proc.communicate(timeout=10)[1] or ""
+        except subprocess.TimeoutExpired:
+            try:
+                perf_proc.kill()
+            except Exception:
+                pass
+            try:
+                perf_stderr = perf_proc.communicate(timeout=2)[1] or ""
+            except Exception:
+                perf_stderr = ""
+        except Exception as e:
+            print(f"Warning: failed to stop/read perf output: {e}")
+
+    be_end_time = time.monotonic()
+    be_real_time = max(0.0, be_end_time - be_start_time)
+
+    instructions, perf_time = (None, None)
+    if perf_stderr:
+        instructions, perf_time = parse_perf_stat_csv(perf_stderr)
+
+        # Save raw perf output for debugging/repro
+        try:
+            perf_out_path = f"{LC_type}/{pressure}/{BE_type}/BE.perf.stat.csv"
+            with open(perf_out_path, "w") as f:
+                f.write(perf_stderr)
+            print(f"[DEBUG] Saved perf output to: {perf_out_path}")
+        except Exception as e:
+            print(f"Warning: failed to write perf output file: {e}")
+
+    # used_time = perf_time if (perf_time is not None and perf_time > 0) else be_real_time
+    used_time = be_real_time
+    if instructions is not None and used_time > 0:
+        throughput = instructions / used_time
+        print(
+            f"BE throughput: instructions={instructions}, "
+            f"real_time={used_time:.6f}s, "
+            f"instructions/sec={throughput:.3f}"
+        )
+    else:
+        print(
+            "BE throughput: unavailable "
+            f"(instructions={instructions}, time={used_time:.6f}s)"
+        )
     
     print("Extract latency from the log file...")
     # Parse results

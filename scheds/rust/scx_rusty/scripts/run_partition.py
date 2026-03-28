@@ -1,8 +1,11 @@
-import os
-import subprocess
-import signal
-import time
 import argparse
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
 from pathlib import Path
 
 TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
@@ -283,6 +286,136 @@ def read_thread_cpu_time(tid: int) -> int | None:
         return None
 
 
+def read_process_cmdline(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+    except (FileNotFoundError, ProcessLookupError):
+        return ""
+    return raw.replace(b"\0", b" ").decode(errors="replace").strip()
+
+
+def find_runspec_pid_bfs(root_pid: int, exclude_bash_c: bool = True) -> int | None:
+    """
+    BFS from the BE root shell PID; first process whose cmdline contains runspec but is
+    not a `bash -c '... runspec ...'` wrapper (same idea as scripts/test_perf.py).
+    """
+    q: deque[int] = deque([root_pid])
+    seen: set[int] = set()
+    while q:
+        pid = q.popleft()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        cmd = read_process_cmdline(pid)
+        if "runspec" in cmd:
+            if exclude_bash_c and "bash -c" in cmd:
+                pass
+            else:
+                return pid
+        for c in get_child_pids(pid):
+            q.append(c)
+    return None
+
+
+def wait_for_runspec_pid_bfs(
+    root_pid: int,
+    timeout_sec: float = 120.0,
+    poll_interval: float = 0.5,
+) -> int | None:
+    deadline = time.monotonic() + timeout_sec
+    while time.monotonic() < deadline:
+        pid = find_runspec_pid_bfs(root_pid)
+        if pid is not None:
+            return pid
+        time.sleep(poll_interval)
+    return None
+
+
+def start_be_throughput_monitor(be_pid: int):
+    """
+    Best-effort `perf stat -p <be_pid>` for BE instructions (target: runspec PID from BFS).
+    Uses `-x,` so stderr stays CSV-shaped for `parse_perf_stat_csv`.
+    """
+    print(f"[throughput] perf stat target PID: {be_pid}")
+    start_time = time.monotonic()
+    cmd = [
+        "sudo",
+        "perf",
+        "stat",
+        "-x,",
+        "-e",
+        "instructions",
+        "-p",
+        str(be_pid),
+    ]
+    try:
+        perf_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        print(f"[throughput] started perf stat -p {be_pid}")
+        return perf_proc, start_time
+    except FileNotFoundError:
+        print("Warning: `perf` not found; BE throughput will not be measured.")
+        return None, start_time
+    except Exception as e:
+        print(f"Warning: failed to start `perf stat` for BE throughput: {e}")
+        return None, start_time
+
+
+def _throughput_monitor_worker(root_pid: int, out: dict) -> None:
+    """Wait for runspec under BE root via BFS, then start `perf stat -p`."""
+    runspec_pid = wait_for_runspec_pid_bfs(root_pid)
+    if runspec_pid is None:
+        out["runspec_pid"] = None
+        out["perf_proc"] = None
+        out["perf_start_time"] = None
+        return
+    out["runspec_pid"] = runspec_pid
+    perf_proc, out["perf_start_time"] = start_be_throughput_monitor(runspec_pid)
+    out["perf_proc"] = perf_proc
+
+
+def parse_perf_stat_csv(stderr_text: str) -> tuple[int | None, float | None]:
+    """
+    Parse `perf stat -x,` stderr output.
+    Returns (instructions, seconds_elapsed).
+    """
+    instructions: int | None = None
+    seconds_elapsed: float | None = None
+
+    for line in stderr_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 2:
+            continue
+
+        value_str = parts[0].replace(" ", "").replace("<notcounted>", "").replace("<not-supported>", "")
+        event = parts[1]
+
+        if event == "instructions":
+            # value can be like "1,234,567" or "1234567" depending on locale; normalize.
+            v = parts[0].replace(",", "").strip()
+            try:
+                instructions = int(float(v))
+            except ValueError:
+                continue
+
+        if "seconds time elapsed" in line:
+            v = parts[0].replace(",", "").strip()
+            try:
+                seconds_elapsed = float(v)
+            except ValueError:
+                continue
+
+    return instructions, seconds_elapsed
+
+
 def measure_lc_load(
     lc_root_pid: int,
     total_cores: int,
@@ -432,6 +565,15 @@ def run(
 
     print(f"BE process PID: {be_process.pid}")
 
+    be_wall_start = time.monotonic()
+    mon_state: dict = {}
+    mon_thread = threading.Thread(
+        target=_throughput_monitor_worker,
+        args=(be_process.pid, mon_state),
+        daemon=True,
+    )
+    mon_thread.start()
+
     available_cores = get_available_cores_from_mask(CORE_MASK_HEX, Num_total_cores)
     total_cores = len(available_cores)
 
@@ -461,7 +603,8 @@ def run(
         if measured_latency_ms is not None:
             latency_source = "bpf_map"
         else:
-            raise Exception("Latency not available yet, skipping this interval.")
+            print("Latency not available yet, skipping this interval.")
+            continue
         lc_load, last_cpu_times = measure_lc_load(
             lc_root_pid=lc_process.pid,
             total_cores=total_cores,
@@ -544,6 +687,67 @@ def run(
             print(f"BE process already finished (status: {be_status})")
     except (ProcessLookupError, AttributeError) as e:
         print(f"Error checking BE process status: {e}")
+
+    mon_thread.join(timeout=125)
+    perf_proc = mon_state.get("perf_proc")
+    be_start_time = mon_state.get("perf_start_time")
+    if be_start_time is None:
+        be_start_time = be_wall_start
+    if mon_state.get("runspec_pid") is None:
+        print(
+            "Warning: runspec PID not found in BE subtree for perf stat.",
+            file=sys.stderr,
+        )
+
+    # Stop perf monitor and report BE throughput.
+    perf_stderr = ""
+    if perf_proc is not None:
+        try:
+            if perf_proc.poll() is None:
+                perf_proc.send_signal(signal.SIGINT)
+            perf_stderr = perf_proc.communicate(timeout=10)[1] or ""
+        except subprocess.TimeoutExpired:
+            try:
+                perf_proc.kill()
+            except Exception:
+                pass
+            try:
+                perf_stderr = perf_proc.communicate(timeout=2)[1] or ""
+            except Exception:
+                perf_stderr = ""
+        except Exception as e:
+            print(f"Warning: failed to stop/read perf output: {e}")
+
+    be_end_time = time.monotonic()
+    be_real_time = max(0.0, be_end_time - be_start_time)
+
+    instructions, perf_time = (None, None)
+    if perf_stderr:
+        instructions, perf_time = parse_perf_stat_csv(perf_stderr)
+
+        # Save raw perf output for debugging/repro
+        try:
+            perf_out_path = f"{LC_type}/{pressure}/{BE_type}/BE.perf.stat.csv"
+            with open(perf_out_path, "w") as f:
+                f.write(perf_stderr)
+            print(f"[DEBUG] Saved perf output to: {perf_out_path}")
+        except Exception as e:
+            print(f"Warning: failed to write perf output file: {e}")
+
+    # used_time = perf_time if (perf_time is not None and perf_time > 0) else be_real_time
+    used_time = be_real_time
+    if instructions is not None and used_time > 0:
+        throughput = instructions / used_time
+        print(
+            f"BE throughput: instructions={instructions}, "
+            f"real_time={used_time:.6f}s, "
+            f"instructions/sec={throughput:.3f}"
+        )
+    else:
+        print(
+            "BE throughput: unavailable "
+            f"(instructions={instructions}, time={used_time:.6f}s)"
+        )
 
     print("Extract latency from the log file...")
 
