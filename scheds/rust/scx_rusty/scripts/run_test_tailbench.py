@@ -1,14 +1,18 @@
-import os
-import subprocess
-import signal
-import time
 import argparse
 import ctypes
 import ctypes.util
+import os
+import signal
 import struct
+import subprocess
+import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from be_throughput_perf import parse_perf_stat_csv, throughput_monitor_worker
 
 TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
 SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "470.lbm", "473.astar", "483.xalancbmk"]
@@ -387,77 +391,6 @@ def read_thread_cpu_time(tid: int) -> int | None:
         return None
 
 
-def start_be_throughput_monitor(be_pid: int):
-    """
-    Start a best-effort `perf stat` monitor for BE instructions.
-
-    We use `--all-child` so forked children are accounted for. Output is CSV so we can parse it.
-    Returns (perf_process, start_time_monotonic) or (None, start_time_monotonic) on failure.
-    """
-    start_time = time.monotonic()
-    cmd = [
-        "sudo",
-        "perf",
-        "stat",
-        "-x,",
-        "-e",
-        "instructions",
-        "-p",
-        str(be_pid),
-    ]
-    try:
-        perf_proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        print(f"[DEBUG] Started perf monitor for BE PID {be_pid}")
-        return perf_proc, start_time
-    except FileNotFoundError:
-        print("Warning: `perf` not found; BE throughput will not be measured.")
-        return None, start_time
-    except Exception as e:
-        print(f"Warning: failed to start `perf stat` for BE throughput: {e}")
-        return None, start_time
-
-
-def parse_perf_stat_csv(stderr_text: str) -> tuple[int | None, float | None]:
-    """
-    Parse `perf stat -x,` stderr output.
-    Returns (instructions, seconds_elapsed).
-    """
-    instructions: int | None = None
-    seconds_elapsed: float | None = None
-
-    for line in stderr_text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2:
-            continue
-
-        value_str = parts[0].replace(" ", "").replace("<notcounted>", "").replace("<not-supported>", "")
-        event = parts[1]
-
-        if event == "instructions":
-            # value can be like "1,234,567" or "1234567" depending on locale; normalize.
-            v = parts[0].replace(",", "").strip()
-            try:
-                instructions = int(float(v))
-            except ValueError:
-                continue
-
-        if "seconds time elapsed" in line:
-            v = parts[0].replace(",", "").strip()
-            try:
-                seconds_elapsed = float(v)
-            except ValueError:
-                continue
-
-    return instructions, seconds_elapsed
-
 def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None, debug_mode=False):
     os.makedirs(LC_type, exist_ok=True)
     os.makedirs(f"{LC_type}/{pressure}", exist_ok=True)
@@ -605,7 +538,15 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
 
     print(f"BE process PID: {be_process.pid}")
 
-    perf_proc, be_start_time = start_be_throughput_monitor(be_process.pid)
+    be_wall_start = time.monotonic()
+    mon_state: dict = {}
+    mon_thread = threading.Thread(
+        target=throughput_monitor_worker,
+        args=(be_process.pid, mon_state),
+        kwargs={"perf_csv": True},
+        daemon=True,
+    )
+    mon_thread.start()
 
     # One-time: collect and write BE process and sub-process PIDs to ring buffer
     print("Collecting BE process and sub-process PIDs (one-time)...")
@@ -663,6 +604,17 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
     except (ProcessLookupError, AttributeError) as e:
         print(f"Error checking BE process status: {e}")
 
+    mon_thread.join(timeout=125)
+    perf_proc = mon_state.get("perf_proc")
+    be_start_time = mon_state.get("perf_start_time")
+    if be_start_time is None:
+        be_start_time = be_wall_start
+    if mon_state.get("runspec_pid") is None:
+        print(
+            "Warning: runspec PID not found in BE subtree for perf stat.",
+            file=sys.stderr,
+        )
+
     # Stop perf monitor and report BE throughput.
     perf_stderr = ""
     if perf_proc is not None:
@@ -684,22 +636,22 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
 
     be_end_time = time.monotonic()
     be_real_time = max(0.0, be_end_time - be_start_time)
+    # used_time = perf_time if (perf_time is not None and perf_time > 0) else be_real_time
+    used_time = be_real_time
 
     instructions, perf_time = (None, None)
     if perf_stderr:
         instructions, perf_time = parse_perf_stat_csv(perf_stderr)
 
-        # Save raw perf output for debugging/repro
+        # Save raw perf output for debugging/repro (prepend wall-clock window used for throughput)
         try:
             perf_out_path = f"{LC_type}/{pressure}/{BE_type}/BE.perf.stat.csv"
             with open(perf_out_path, "w") as f:
+                f.write(f"# used_time_sec={used_time:.9f}\n")
                 f.write(perf_stderr)
             print(f"[DEBUG] Saved perf output to: {perf_out_path}")
         except Exception as e:
             print(f"Warning: failed to write perf output file: {e}")
-
-    # used_time = perf_time if (perf_time is not None and perf_time > 0) else be_real_time
-    used_time = be_real_time
     if instructions is not None and used_time > 0:
         throughput = instructions / used_time
         print(
