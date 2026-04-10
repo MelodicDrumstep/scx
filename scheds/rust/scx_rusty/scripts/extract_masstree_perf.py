@@ -6,6 +6,8 @@ from pathlib import Path
 # Matches: "end2end: mean ... | p95 ... | p99 3.024 ms | max ... ms"
 END2END_P99_RE = re.compile(r"^\s*end2end:.*?\|\s*p99\s+([0-9]+(?:\.[0-9]+)?)\s*ms\b", re.M)
 USED_TIME_RE = re.compile(r"^\s*#\s*used_time_sec\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*$")
+USED_TIME_DEFAULT_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s+seconds time elapsed\s*$", re.M)
+INSTRUCTIONS_DEFAULT_RE = re.compile(r"^\s*([0-9][0-9,]*)\s+instructions\s*$", re.M)
 
 
 def parse_p99_end2end_ms(latency_log_path: Path) -> float:
@@ -16,40 +18,88 @@ def parse_p99_end2end_ms(latency_log_path: Path) -> float:
     return float(m.group(1))
 
 
-def parse_instructions_per_sec(be_perf_stat_csv_path: Path) -> float:
+def parse_instructions_per_macrosecond(be_perf_stat_csv_path: Path) -> float:
+    """
+    Parse BE perf output and return instructions per microsecond.
+
+    Supports two layouts:
+    1) CSV-ish (-x,) with our injected "# used_time_sec=..." header.
+    2) Human-readable perf output:
+       "X instructions" and "Y seconds time elapsed"
+    """
+    raw_text = be_perf_stat_csv_path.read_text()
+    # For parsing the human-readable perf output, ignore comments and empty lines
+    # so headers like "# used_time_sec=..." don't interfere.
+    filtered_lines = []
+    for ln in raw_text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        filtered_lines.append(ln)
+    text = "\n".join(filtered_lines)
+
+    # print(text)
+
     used_time_sec = None
     instructions = None
 
-    for line in be_perf_stat_csv_path.read_text().splitlines():
+    # 1) Prefer our injected header for used time (from the *raw* file).
+    for line in raw_text.splitlines():
         line = line.strip()
         if not line:
             continue
-
-        # Header we added in scripts: "# used_time_sec=..."
         if line.startswith("#"):
             m = USED_TIME_RE.match(line)
             if m:
                 used_time_sec = float(m.group(1))
-            continue
+                break
 
-        # perf stat -x, CSV line format (example):
-        # "61057972714,,instructions,21076111350,100.00,,"
-        parts = line.split(",")
-        if len(parts) < 4:
-            continue
+    # 2) If missing, try default perf line.
+    if used_time_sec is None:
+        m = USED_TIME_DEFAULT_RE.search(text)
+        if m:
+            used_time_sec = float(m.group(1))
 
-        event = parts[2].strip()
-        value = parts[3].strip()
+    # 3) Instructions: try default perf line first.
+    if instructions is None:
+        m = INSTRUCTIONS_DEFAULT_RE.search(text)
+        if m:
+            instructions = float(m.group(1).replace(",", ""))
 
-        if event == "instructions":
-            instructions = float(value)
+    # 4) Instructions: try CSV-ish layout (-x,) if needed.
+    if instructions is None:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if len(parts) < 4:
+                continue
+            event = parts[2].strip()
+            if event != "instructions":
+                continue
+            # Usually the instruction count is the first element.
+            try:
+                instructions = float(parts[0].replace(",", "").strip())
+            except ValueError:
+                # Fallback: sometimes count appears in another column.
+                try:
+                    instructions = float(parts[3].replace(",", "").strip())
+                except ValueError:
+                    instructions = None
+            if instructions is not None:
+                break
 
     if used_time_sec is None:
-        raise ValueError(f"Missing used_time_sec header in {be_perf_stat_csv_path}")
+        raise ValueError(f"Missing used_time_sec in {be_perf_stat_csv_path}")
+    if used_time_sec <= 0:
+        raise ValueError(f"Invalid used_time_sec={used_time_sec} in {be_perf_stat_csv_path}")
     if instructions is None:
-        raise ValueError(f"Missing `instructions` row in {be_perf_stat_csv_path}")
+        raise ValueError(f"Missing `instructions` in {be_perf_stat_csv_path}")
 
-    return instructions / used_time_sec
+    # 1 microsecond = 1e-6 seconds.
+    instructions_per_us = instructions / (used_time_sec * 1_000_000.0)
+    return instructions_per_us
 
 
 def main():
@@ -73,31 +123,27 @@ def main():
         raise SystemExit(f"Root does not exist: {root}")
 
     rows = []
-    # Expect: <root>/<benchmark>/latency.log and <root>/<benchmark>/BE.perf.stat.csv
-    for lat_path in sorted(root.rglob("latency.log")):
-        bench_dir = lat_path.parent
-        be_perf_path = bench_dir / "BE.perf.stat.csv"
-        if not be_perf_path.exists():
-            print(f"Warning: missing {be_perf_path}, skipping {bench_dir.name}")
-            continue
+    # Expect: <root>/<benchmark>/BE.perf.stat.csv always; latency.log may be missing.
+    for be_perf_path in sorted(root.rglob("BE.perf.stat.csv")):
+        bench_dir = be_perf_path.parent
+        lat_path = bench_dir / "latency.log"
 
-        p99_ms = parse_p99_end2end_ms(lat_path)
-        ips = parse_instructions_per_sec(be_perf_path)
+        ins_per_us = parse_instructions_per_macrosecond(be_perf_path)
+        p99_ms: float | None = None
+        if lat_path.exists():
+            p99_ms = parse_p99_end2end_ms(lat_path)
 
-        rows.append((bench_dir.name, p99_ms, ips))
+        rows.append((bench_dir.name, p99_ms, ins_per_us))
 
     # CSV header
-    header = "benchmark,p99_end2end_ms,instructions_per_sec"
+    header = "benchmark,p99_end2end_ms,instructions_per_microsecond"
     out_lines = [header]
-    def fmt_times_10_pow(x: float, digits: int = 2) -> str:
-        if x == 0:
-            return f"{0:.{digits}f}" # \times 10^9
-        exp = int(f"{x:e}".split("e")[1])
-        mant = x / (10 ** exp)
-        return f"{mant:.{digits}f} \\\\times 10^{exp}"
+    def fmt(x: float, digits: int = 3) -> str:
+        return f"{x:.{digits}f}"
 
-    for bench, p99_ms, ips in rows:
-        out_lines.append(f"{bench},{p99_ms:.3f},{fmt_times_10_pow(ips, 2)}")
+    for bench, p99_ms, ins_per_us in rows:
+        p99_str = f"{p99_ms:.3f}" if p99_ms is not None else ""
+        out_lines.append(f"{bench},{p99_str},{fmt(ins_per_us, 3)}")
 
     if args.out:
         Path(args.out).write_text("\n".join(out_lines) + "\n")

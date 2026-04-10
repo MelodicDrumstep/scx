@@ -12,26 +12,16 @@ from be_throughput_perf import parse_perf_stat_csv, throughput_monitor_worker
 
 TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
 SPEC_2006_BE_list = [
-    "400.perlbench",
-    "401.bzip2",
-    "403.gcc",
     "429.mcf",
-    "445.gobmk",
-    "456.hmmer",
-    "458.sjeng",
-    "462.libquantum",
-    "464.h264ref",
     "470.lbm",
-    "473.astar",
-    "483.xalancbmk",
 ]
 First_SMT_silibing_core_ID = 20
 Num_total_cores = 40
 
 # Control policy parameters (adjust as needed)
 CONTROL_INTERVAL_SEC = 1.0
-LC_P99_HIGH_MS = 2.5
-LC_P99_LOW_MS = 2
+LC_P99_HIGH_MS = 2
+LC_P99_LOW_MS = 1.5
 LC_MIN_CORES = 1
 
 # We only use cores 0, 4, 8, 12 ... 36 (0x1111111111)
@@ -604,7 +594,7 @@ def run(
         try:
             perf_out_path = f"{LC_type}/{pressure}/{BE_type}/BE.perf.stat.csv"
             with open(perf_out_path, "w") as f:
-                f.write(f"# used_time_sec={used_time:.9f}\n")
+                # f.write(f"# used_time_sec={used_time:.9f}\n")
                 f.write(perf_stderr)
             print(f"[DEBUG] Saved perf output to: {perf_out_path}")
         except Exception as e:

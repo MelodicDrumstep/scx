@@ -406,6 +406,19 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
     else:
         raise Exception("Invalid pressure level, only [low / medium / high] are supported")
 
+    # Build taskset command based on num_cores or NUMA_unaware
+    taskset_cmd = ""
+    if num_cores:
+        # Use specified cores
+        cpu_list = ','.join(map(str, range(num_cores)))
+        taskset_cmd = f"taskset -c {cpu_list} "
+    elif NUMA_unaware:
+        # Use NUMA0 cores (even cores)
+        taskset_cmd = f"taskset 0x1111111111 "
+    else:
+        # Use default CPU mask for even cores 0-38 (0x5555555555)
+        taskset_cmd = "taskset 0x1111111111 "
+
     # Masstree configuration
     if LC_type == "masstree":
         lats_bin = TailbenchDir / "masstree" / "lats.bin"
@@ -415,19 +428,6 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
         WARMUPREQS = QPS
         MINSLEEPNS = 100
         NTHREADS = os.environ.get("NTHREADS", "10")
-        
-        # Build taskset command based on num_cores or NUMA_unaware
-        taskset_cmd = ""
-        if num_cores:
-            # Use specified cores
-            cpu_list = ','.join(map(str, range(num_cores)))
-            taskset_cmd = f"taskset -c {cpu_list} "
-        elif NUMA_unaware:
-            # Use NUMA0 cores (even cores)
-            taskset_cmd = f"taskset 0x1111111111 "
-        else:
-            # Use default CPU mask for even cores 0-38 (0x5555555555)
-            taskset_cmd = "taskset 0x1111111111 "
         
         # Construct masstree command with 10s sleep to allow scheduler to process ring buffer
         LC_cmd = (
@@ -440,7 +440,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
     elif LC_type == "specjbb":
         lats_bin = TailbenchDir / "specjbb" / "lats.bin"
         SPECJBB_DIR = TailbenchDir / "specjbb"
-        qps = 140000
+        qps = int(15000 * pressure_num)
         run_sh = SPECJBB_DIR / "run.sh"
         if not run_sh.exists():
             print(f"ERROR: {run_sh} not found")
@@ -448,8 +448,11 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
 
         # sleep 10s first
         LC_cmd = (
-            f"bash -c 'sleep 10 && {run_sh} {qps}'"
+            f"bash -c 'sleep 10 && cd {SPECJBB_DIR} && sudo {taskset_cmd} {run_sh} {qps}'"
         )
+
+        # DEBUG
+        print(f"LC_cmd: {LC_cmd}")
 
     # delete lats.bin if it exists
     if lats_bin.exists():
@@ -595,7 +598,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
             print("BE process still running, terminating...")
             os.killpg(os.getpgid(be_process.pid), signal.SIGTERM)
             try:
-                be_process.wait(timeout=5)
+                be_process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 os.killpg(os.getpgid(be_process.pid), signal.SIGKILL)
                 be_process.wait()
@@ -647,7 +650,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
         try:
             perf_out_path = f"{LC_type}/{pressure}/{BE_type}/BE.perf.stat.csv"
             with open(perf_out_path, "w") as f:
-                f.write(f"# used_time_sec={used_time:.9f}\n")
+                # f.write(f"# used_time_sec={used_time:.9f}\n")
                 f.write(perf_stderr)
             print(f"[DEBUG] Saved perf output to: {perf_out_path}")
         except Exception as e:

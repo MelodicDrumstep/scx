@@ -570,7 +570,7 @@ impl<'a> Scheduler<'a> {
             stats_server,
 
             latency_map_fd,
-            latency_check_interval: Duration::from_millis(500), // Check every 500ms
+            latency_check_interval: Duration::from_millis(1000), // Check every 1000ms
             next_latency_check: Instant::now(),
         })
     }
@@ -660,15 +660,41 @@ impl<'a> Scheduler<'a> {
     }
 
     fn check_latency(&mut self) -> Result<()> {
-        const LATENCY_THRESHOLD_NS: u32 = 2000000;
+        const LATENCY_THRESHOLD_NS: u32 = 500000;
         const MAP_KEY: u32 = 0;
-
+        
+        // Track initialization state
+        static mut FIRST_CALL: bool = true;
+    
         if let Some(latency_fd) = self.latency_map_fd {
+            // On first call, explicitly set latency to 0 in the BPF map
+            unsafe {
+                if FIRST_CALL {
+                    let key = MAP_KEY.to_ne_bytes();
+                    let zero_value: u32 = 0;
+                    let value_ptr = &zero_value as *const u32 as *const libc::c_void;
+                    
+                    let ret = libbpf_sys::bpf_map_update_elem(
+                        latency_fd,
+                        key.as_ptr() as *const libc::c_void,
+                        value_ptr,
+                        0, // BPF_ANY flag
+                    );
+                    
+                    if ret == 0 {
+                        info!("Initialized latency map to 0");
+                    } else {
+                        info!("Failed to initialize latency map: {}", ret);
+                    }
+                    FIRST_CALL = false;
+                }
+            }
+            
             // Read latency value from external map
             let mut latency_value: u32 = 0;
             let key = MAP_KEY.to_ne_bytes();
             let value_ptr = &mut latency_value as *mut u32 as *mut libc::c_void;
-
+    
             let ret = unsafe {
                 libbpf_sys::bpf_map_lookup_elem(
                     latency_fd,
@@ -676,23 +702,23 @@ impl<'a> Scheduler<'a> {
                     value_ptr,
                 )
             };
-
+    
             if ret == 0 {
-                // // DEBUGING
+                // Print the latency value here
                 // info!("Latency value: {} ns", latency_value);
+                // Check if this is the first successful read after initialization
                 
-                // Successfully read latency
                 let high_latency = latency_value > LATENCY_THRESHOLD_NS;
-
+    
                 // Update high latency flag in BPF map
                 let flag_map = &self.skel.maps.high_latency_flag;
                 let flag_key = MAP_KEY.to_ne_bytes();
                 let flag_value: u8 = if high_latency { 1 } else { 0 };
-
+    
                 flag_map
                     .update(&flag_key, &flag_value.to_ne_bytes(), MapFlags::ANY)
                     .context("Failed to update high latency flag")?;
-
+    
                 if high_latency {
                     info!("High latency detected: {} ns (threshold: {} ns)", 
                           latency_value, LATENCY_THRESHOLD_NS);
@@ -702,7 +728,7 @@ impl<'a> Scheduler<'a> {
                 // Silently continue - this is not critical
             }
         }
-
+    
         Ok(())
     }
 

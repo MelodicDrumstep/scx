@@ -87,7 +87,7 @@ const volatile u32 greedy_threshold_x_numa;
 const volatile u32 rusty_perf_mode;
 const volatile u32 debug;
 
-const u32 BE_DISPATCH_PROB = 50; // 50% probability to check for BE task
+const u32 BE_DISPATCH_PROB = 80; // 80% probability to check for BE task
 
 /* base slice duration */
 volatile u64 slice_ns;
@@ -539,7 +539,7 @@ struct {
 	__uint(map_flags, 0);
 } high_latency_flag SEC(".maps");
 
-/* Cooldown period after BE kick: 1s in nanoseconds */
+/* Cooldown period after BE kick: 1000ms in nanoseconds */
 #define BE_KICK_COOLDOWN_NS 1000000000ULL
 
 static inline void stat_add(enum stat_idx idx, u64 addend)
@@ -1638,8 +1638,8 @@ void BPF_STRUCT_OPS(rusty_enqueue, struct task_struct *p __arg_trusted, u64 enq_
 	/* Check if this is a BE task - enqueue to pending DSQ */
 	if (should_delay_be_task(taskc)) {
 		// if (debug >= 2) {
-			bpf_printk("[enqueue] BE task enqueued to pending DSQ: PID=%u (%s)",
-				READ_ONCE(p->pid), p->comm);
+			// bpf_printk("[enqueue] BE task enqueued to pending DSQ: PID=%u (%s)",
+			// 	READ_ONCE(p->pid), p->comm);
 		// }
 		stat_add(RUSTY_STAT_BE_DELAYED, 1);
 		
@@ -1878,7 +1878,7 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 	if ((cpu_u % 4) == 0 && (bpf_get_prandom_u32() % 100) < BE_DISPATCH_PROB) {
 		/* Check if BE dispatch is allowed (not within cooldown period after BE kick) */
 		if (!is_be_dispatch_allowed()) {
-			bpf_printk("[dispatch] BE dispatch blocked due to cooldown period on CPU %d", cpu);
+			// bpf_printk("[dispatch] BE dispatch blocked due to cooldown period on CPU %d", cpu);
 			goto skip_be_dispatch;
 		}
 
@@ -1886,7 +1886,7 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 		if (is_high_latency()) {
 			/* High latency detected - could adjust BE dispatch behavior here */
 			/* For example: reduce BE dispatch probability or delay BE tasks further */
-			bpf_printk("[dispatch] High latency detected - could adjust BE dispatch behavior here");
+			// bpf_printk("[dispatch] High latency detected - could adjust BE dispatch behavior here");
 			goto skip_be_dispatch;
 		}
 
@@ -1900,7 +1900,7 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 				if (cpu_sibling_task_type && *cpu_sibling_task_type == TASK_TYPE_UNINITIALIZED) {
 					/* Both current CPU and SMT sibling have no LC task running */
 					can_dispatch_be = true;
-					bpf_printk("[dispatch] We can dispatch BE task on CPU %d since CPU task type is %d and sibling task type is %d", cpu, *cpu_task_type, *cpu_sibling_task_type);
+					// bpf_printk("[dispatch] We can dispatch BE task on CPU %d since CPU task type is %d and sibling task type is %d", cpu, *cpu_task_type, *cpu_sibling_task_type);
 				}
 			}
 		}
@@ -1909,7 +1909,7 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 			if (scx_bpf_dsq_move_to_local(PENDING_DSQ_ID)) {
 				stat_add(RUSTY_STAT_BE_DELAYED, 1);
 				// if (debug >= 2) {
-					bpf_printk("[dispatch] Dispatched BE task from pending DSQ on CPU %d", cpu);
+					// bpf_printk("[dispatch] Dispatched BE task from pending DSQ on CPU %d", cpu);
 				// }
 				update_cpu_running_task_type(cpu, TASK_TYPE_BE);
 				// DEBUGING

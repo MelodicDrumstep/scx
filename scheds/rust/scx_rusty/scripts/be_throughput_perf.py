@@ -91,8 +91,8 @@ def start_be_throughput_monitor(be_pid: int, *, perf_csv: bool = False):
         "perf",
         "stat",
     ]
-    if perf_csv:
-        cmd.append("-x,")
+    # if perf_csv:
+    #     cmd.append("-x,")
     cmd.extend(
         [
             "-e",
