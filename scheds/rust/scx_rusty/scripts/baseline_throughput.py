@@ -23,35 +23,34 @@ SPEC_2006_BE_list = [
     "458.sjeng",
     "462.libquantum",
     "464.h264ref",
-    "470.lbm",
     "473.astar",
     "483.xalancbmk",
 ]
 
 First_SMT_silibing_core_ID = 20
 Num_total_cores = 40
-CORE_MASK_HEX = "0x1111111111"
-
 
 def build_be_cmd(be_type: str, num_cores: int | None, numa_unaware: bool) -> str:
     spec_dir = os.path.expanduser("/home/dell-07/wltu/speccpu2006-v1.0.1")
-    if num_cores:
-        return (
-            f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && "
-            f"taskset -c {First_SMT_silibing_core_ID}-{First_SMT_silibing_core_ID + num_cores - 1} "
-            f"runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {num_cores} {be_type}'"
-        )
     if numa_unaware:
+        if (not num_cores) or (num_cores == 10):
+            taskset_cmd = f"taskset 0x1111111111 "
+        elif num_cores == 5:
+            taskset_cmd = f"taskset 0x1010101010"
+        elif num_cores == 15:
+            taskset_cmd = f"taskset 0x5555511111"
+        elif num_cores == 20:
+            taskset_cmd = f"taskset 0x5555555555"
+        else:
+            raise Exception("Invalid num_cores")
         return (
             f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && "
-            f"taskset {CORE_MASK_HEX} "
+            f"{taskset_cmd} "
             f"runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 4)} {be_type}'"
         )
-    return (
-        f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && "
-        f"runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores)} {be_type}'"
-    )
-
+    else:
+        raise Exception("Invalid num_cores")
+        return ""
 
 def kill_process_group(proc: subprocess.Popen, sig: signal.Signals) -> None:
     try:

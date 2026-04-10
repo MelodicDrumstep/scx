@@ -18,14 +18,27 @@ SPEC_2006_BE_list = [
 First_SMT_silibing_core_ID = 20
 Num_total_cores = 40
 
+QPS_limit_masstree = {
+   10 : 11700, # tested
+   # random:
+   5 : ,
+   15 : 
+   20 : 
+}
+
+QPS_limit_specjbb = {
+   10 : 140000, # tested
+   # random:
+   5 : ,
+   15 : 
+   20 : 
+}
+
 # Control policy parameters (adjust as needed)
 CONTROL_INTERVAL_SEC = 1.0
 LC_P99_HIGH_MS = 2
 LC_P99_LOW_MS = 1.5
 LC_MIN_CORES = 1
-
-# We only use cores 0, 4, 8, 12 ... 36 (0x1111111111)
-CORE_MASK_HEX = "0x1111111111"
 
 DEFAULT_LATENCY_MAP_PATH = "/sys/fs/bpf/latency_map_path"
 
@@ -339,23 +352,30 @@ def run(
     else:
         raise Exception("Invalid pressure level, only [low / medium / high] are supported")
 
+    taskset_cmd = ""
+    if NUMA_unaware:
+        if (not num_cores) or (num_cores == 10):
+            num_cores = int(10)
+            taskset_cmd = f"taskset 0x1111111111 "
+        elif num_cores == 5:
+            taskset_cmd = f"taskset 0x1010101010"
+        elif num_cores == 15:
+            taskset_cmd = f"taskset 0x5555511111"
+        elif num_cores == 20:
+            taskset_cmd = f"taskset 0x5555555555"
+        else:
+            raise Exception("Invalid num_cores")
+    else:
+        raise Exception("Invalid num_cores")
+
     if LC_type == "masstree":
         lats_bin = TailbenchDir / "masstree" / "lats.bin"
         masstree_dir = TailbenchDir / "masstree"
-        QPS = int(11700 * pressure_num)
+        QPS = int(QPS_limit_masstree[num_cores] * pressure_num)
         MAXREQS = QPS * 60
         WARMUPREQS = QPS
         MINSLEEPNS = 100
         NTHREADS = os.environ.get("NTHREADS", "10")
-
-        taskset_cmd = ""
-        if num_cores:
-            cpu_list = ",".join(map(str, range(num_cores)))
-            taskset_cmd = f"taskset -c {cpu_list} "
-        elif NUMA_unaware:
-            taskset_cmd = f"taskset {CORE_MASK_HEX} "
-        else:
-            taskset_cmd = f"taskset {CORE_MASK_HEX} "
 
         LC_cmd = (
             f"bash -c 'sleep 10 && cd {masstree_dir} && "
@@ -367,13 +387,16 @@ def run(
     elif LC_type == "specjbb":
         lats_bin = TailbenchDir / "specjbb" / "lats.bin"
         SPECJBB_DIR = TailbenchDir / "specjbb"
-        qps = 140000
+        qps = int(QPS_limit_specjbb[num_cores] * pressure_num)
         run_sh = SPECJBB_DIR / "run.sh"
         if not run_sh.exists():
             print(f"ERROR: {run_sh} not found")
             return False
 
-        LC_cmd = f"bash -c 'sleep 10 && {run_sh} {qps}'"
+        # sleep 10s first
+        LC_cmd = (
+            f"bash -c 'sleep 10 && cd {SPECJBB_DIR} && sudo {taskset_cmd} {run_sh} {qps}'"
+        )
 
     else:
         raise Exception("Unsupported LC_type")

@@ -660,7 +660,7 @@ impl<'a> Scheduler<'a> {
     }
 
     fn check_latency(&mut self) -> Result<()> {
-        const LATENCY_THRESHOLD_NS: u32 = 500000;
+        const LATENCY_THRESHOLD_NS: u32 = 2200000;
         const MAP_KEY: u32 = 0;
         
         // Track initialization state

@@ -15,9 +15,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from be_throughput_perf import parse_perf_stat_csv, throughput_monitor_worker
 
 TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
-SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "470.lbm", "473.astar", "483.xalancbmk"]
+SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "473.astar", "483.xalancbmk"]
 First_SMT_silibing_core_ID = 20 # Hard coded
 Num_total_cores = 40 # with SMT counted
+
+QPS_limit_masstree = {
+   10 : 11700, # tested
+   # random:
+   5 : 5850,
+   15 : 17550,
+   20 : 23400,
+}
+
+QPS_limit_specjbb = {
+   10 : 15000, # tested
+}
 
 def generate_even_string(x):
     return ','.join(str(num) for num in range(0, x, 2))
@@ -408,22 +420,27 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
 
     # Build taskset command based on num_cores or NUMA_unaware
     taskset_cmd = ""
-    if num_cores:
-        # Use specified cores
-        cpu_list = ','.join(map(str, range(num_cores)))
-        taskset_cmd = f"taskset -c {cpu_list} "
-    elif NUMA_unaware:
+    if NUMA_unaware:
         # Use NUMA0 cores (even cores)
-        taskset_cmd = f"taskset 0x1111111111 "
+        if (not num_cores) or (num_cores == 10):
+            num_cores = int(10)
+            taskset_cmd = f"taskset 0x1111111111 "
+        elif num_cores == 5:
+            taskset_cmd = f"taskset 0x1010101010"
+        elif num_cores == 15:
+            taskset_cmd = f"taskset 0x5555511111"
+        elif num_cores == 20:
+            taskset_cmd = f"taskset 0x5555555555"
+        else:
+            raise Exception("Invalid num_cores")
     else:
-        # Use default CPU mask for even cores 0-38 (0x5555555555)
-        taskset_cmd = "taskset 0x1111111111 "
+        raise Exception("Invalid num_cores")
 
     # Masstree configuration
     if LC_type == "masstree":
         lats_bin = TailbenchDir / "masstree" / "lats.bin"
         masstree_dir = TailbenchDir / "masstree"
-        QPS = int(11700 * pressure_num)
+        QPS = int(QPS_limit_masstree[num_cores] * pressure_num)
         MAXREQS = QPS * 60
         WARMUPREQS = QPS
         MINSLEEPNS = 100
@@ -440,7 +457,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
     elif LC_type == "specjbb":
         lats_bin = TailbenchDir / "specjbb" / "lats.bin"
         SPECJBB_DIR = TailbenchDir / "specjbb"
-        qps = int(15000 * pressure_num)
+        qps = int(QPS_limit_specjbb[num_cores] * pressure_num)
         run_sh = SPECJBB_DIR / "run.sh"
         if not run_sh.exists():
             print(f"ERROR: {run_sh} not found")

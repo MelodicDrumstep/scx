@@ -4,7 +4,6 @@ set -euo pipefail
 # get LC and pressure from the command line
 LC=$1
 pressure=$2
-num_cores=$3
 
 # Directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +20,7 @@ BE_TYPES=(
 "458.sjeng"
 "462.libquantum"
 "464.h264ref"
+"470.lbm"
 "473.astar"
 "483.xalancbmk"
 )
@@ -47,7 +47,6 @@ for BE in "${BE_TYPES[@]}"; do
   sudo python3 run_test_tailbench.py \
     --LC ${LC} \
     --BE "${BE}" \
-    -n ${num_cores} \
     --NUMA_unaware \
     --task-type-shm "${TASK_SHM}" \
     -p ${pressure}
