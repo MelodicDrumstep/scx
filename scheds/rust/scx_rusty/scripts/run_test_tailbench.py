@@ -20,15 +20,21 @@ First_SMT_silibing_core_ID = 20 # Hard coded
 Num_total_cores = 40 # with SMT counted
 
 QPS_limit_masstree = {
-   10 : 11700, # tested
-   # random:
-   5 : 5850,
-   15 : 17550,
-   20 : 23400,
+   10 : 11700,
+   5 : 15300,
+   15 : 7900,
+   20 : 6400,
 }
 
 QPS_limit_specjbb = {
    10 : 15000, # tested
+}
+
+CORE_MASK_HEX = {
+    10: "0x1111111111",
+    5: "0x1010101010",
+    15: "0x5555511111",
+    20: "0x5555555555",
 }
 
 def generate_even_string(x):
@@ -418,23 +424,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
     else:
         raise Exception("Invalid pressure level, only [low / medium / high] are supported")
 
-    # Build taskset command based on num_cores or NUMA_unaware
-    taskset_cmd = ""
-    if NUMA_unaware:
-        # Use NUMA0 cores (even cores)
-        if (not num_cores) or (num_cores == 10):
-            num_cores = int(10)
-            taskset_cmd = f"taskset 0x1111111111 "
-        elif num_cores == 5:
-            taskset_cmd = f"taskset 0x1010101010"
-        elif num_cores == 15:
-            taskset_cmd = f"taskset 0x5555511111"
-        elif num_cores == 20:
-            taskset_cmd = f"taskset 0x5555555555"
-        else:
-            raise Exception("Invalid num_cores")
-    else:
-        raise Exception("Invalid num_cores")
+    taskset_cmd = f"taskset {CORE_MASK_HEX[num_cores]}"
 
     # Masstree configuration
     if LC_type == "masstree":
@@ -478,18 +468,9 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
     # SPEC CPU environment - need to cd to directory and source shrc to set up Perl environment
     spec_dir = os.path.expanduser("/home/dell-07/wltu/speccpu2006-v1.0.1")
     
-    if num_cores:
-        # cd to spec directory, source shrc (sets up Perl @INC), then run runspec
+    if NUMA_unaware:
         # Add 10s sleep to allow scheduler to process ring buffer
-        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && taskset -c {First_SMT_silibing_core_ID}-{First_SMT_silibing_core_ID + num_cores - 1} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {num_cores} {BE_type}'"
-    elif NUMA_unaware:
-        # Add 10s sleep to allow scheduler to process ring buffer
-        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && taskset 0x1111111111 runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 4)} {BE_type}'"
-    else:
-        # Add 10s sleep to allow scheduler to process ring buffer
-        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores)} {BE_type}'"
-    # DEBUGING
-    # BE_cmd = "sleep 10000"
+        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && {taskset_cmd} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(num_cores)} {BE_type}'"
 
     print(f"LC_cmd : {LC_cmd}, BE_cmd : {BE_cmd}")
 

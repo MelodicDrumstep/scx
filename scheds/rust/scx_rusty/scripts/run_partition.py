@@ -11,27 +11,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from be_throughput_perf import parse_perf_stat_csv, throughput_monitor_worker
 
 TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
-SPEC_2006_BE_list = [
-    "429.mcf",
-    "470.lbm",
-]
+SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "473.astar", "483.xalancbmk"]
 First_SMT_silibing_core_ID = 20
 Num_total_cores = 40
 
 QPS_limit_masstree = {
-   10 : 11700, # tested
-   # random:
-   5 : ,
-   15 : 
-   20 : 
+   10 : 11700,
+   5 : 15300,
+   15 : 7900,
+   20 : 6400,
 }
 
 QPS_limit_specjbb = {
    10 : 140000, # tested
-   # random:
-   5 : ,
-   15 : 
-   20 : 
+}
+
+CORE_MASK_HEX = {
+    10: "0x1111111111",
+    5: "0x1010101010",
+    15: "0x5555511111",
+    20: "0x5555555555",
 }
 
 # Control policy parameters (adjust as needed)
@@ -352,21 +351,7 @@ def run(
     else:
         raise Exception("Invalid pressure level, only [low / medium / high] are supported")
 
-    taskset_cmd = ""
-    if NUMA_unaware:
-        if (not num_cores) or (num_cores == 10):
-            num_cores = int(10)
-            taskset_cmd = f"taskset 0x1111111111 "
-        elif num_cores == 5:
-            taskset_cmd = f"taskset 0x1010101010"
-        elif num_cores == 15:
-            taskset_cmd = f"taskset 0x5555511111"
-        elif num_cores == 20:
-            taskset_cmd = f"taskset 0x5555555555"
-        else:
-            raise Exception("Invalid num_cores")
-    else:
-        raise Exception("Invalid num_cores")
+    taskset_cmd = f"taskset {CORE_MASK_HEX[num_cores]}"
 
     if LC_type == "masstree":
         lats_bin = TailbenchDir / "masstree" / "lats.bin"
@@ -406,22 +391,27 @@ def run(
 
     spec_dir = os.path.expanduser("/home/dell-07/wltu/speccpu2006-v1.0.1")
 
-    if num_cores:
-        BE_cmd = (
-            f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && "
-            f"taskset -c {First_SMT_silibing_core_ID}-{First_SMT_silibing_core_ID + num_cores - 1} "
-            f"runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {num_cores} {BE_type}'"
-        )
-    elif NUMA_unaware:
-        BE_cmd = (
-            f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && "
-            f"taskset {CORE_MASK_HEX} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 4)} {BE_type}'"
-        )
+    # Build taskset command based on num_cores or NUMA_unaware
+    taskset_cmd = ""
+    if NUMA_unaware:
+        # Use NUMA0 cores (even cores)
+        if (not num_cores) or (num_cores == 10):
+            num_cores = int(10)
+            taskset_cmd = f"taskset 0x1111111111 "
+        elif num_cores == 5:
+            taskset_cmd = f"taskset 0x1010101010 "
+        elif num_cores == 15:
+            taskset_cmd = f"taskset 0x5555511111 "
+        elif num_cores == 20:
+            taskset_cmd = f"taskset 0x5555555555 "
+        else:
+            raise Exception("Invalid num_cores")
     else:
-        BE_cmd = (
-            f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && "
-            f"runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores)} {BE_type}'"
-        )
+        raise Exception("Invalid num_cores")
+
+    if NUMA_unaware:
+        # Add 10s sleep to allow scheduler to process ring buffer
+        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && {taskset_cmd} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(num_cores)} {BE_type}'"
 
     print(f"LC_cmd : {LC_cmd}, BE_cmd : {BE_cmd}")
 
@@ -460,7 +450,7 @@ def run(
     )
     mon_thread.start()
 
-    available_cores = get_available_cores_from_mask(CORE_MASK_HEX, Num_total_cores)
+    available_cores = get_available_cores_from_mask(CORE_MASK_HEX[num_cores], Num_total_cores)
     total_cores = len(available_cores)
 
     lc_cores = total_cores
@@ -714,12 +704,6 @@ if __name__ == "__main__":
         raise Exception("Pressure level is not given")
 
     num_cores: int | None = None
-
-    if args.num_cores:
-        num_cores = args.num_cores
-        if args.NUMA_unaware and num_cores is not None:
-            raise Exception('"NUMA_unaware" is set but "num_cores" is also set, which is not valid')
-
     if not args.LC:
         raise Exception("No LC is given.")
     LC_type = args.LC
