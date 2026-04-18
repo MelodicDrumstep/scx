@@ -9,11 +9,17 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from be_throughput_perf import parse_perf_stat_csv, throughput_monitor_worker
-
-TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
-SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "473.astar", "483.xalancbmk"]
-First_SMT_silibing_core_ID = 20
-Num_total_cores = 40
+from tailbench_common import (
+    CORE_MASK_HEX,
+    Num_total_cores,
+    SPEC_2006_BE_list,
+    TailbenchDir,
+    get_all_thread_ids,
+    get_descendant_pids,
+    get_process_group_pids,
+    kill_all_spec_processes,
+    read_thread_cpu_time,
+)
 
 QPS_limit_masstree = {
    10 : 11700,
@@ -26,115 +32,15 @@ QPS_limit_specjbb = {
    10 : 140000, # tested
 }
 
-CORE_MASK_HEX = {
-    10: "0x1111111111",
-    5: "0x1010101010",
-    15: "0x5555511111",
-    20: "0x5555555555",
-}
-
 # Control policy parameters (adjust as needed)
 CONTROL_INTERVAL_SEC = 1.0
-LC_P99_HIGH_MS = 2
-LC_P99_LOW_MS = 1.5
+LC_P99_HIGH_MS = 1.6
+LC_P99_LOW_MS = 1.2
 LC_MIN_CORES = 1
 
 DEFAULT_LATENCY_MAP_PATH = "/sys/fs/bpf/latency_map_path"
 
 CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-
-
-def get_child_pids(pid: int) -> list[int]:
-    try:
-        result = subprocess.run(
-            ["pgrep", "-P", str(pid)],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        pids = [int(p) for p in result.stdout.strip().split("\n") if p]
-        return pids
-    except (subprocess.CalledProcessError, ValueError):
-        return []
-
-
-def get_descendant_pids(pid: int, max_depth: int = 3) -> list[int]:
-    pids: list[int] = []
-    current_level = [pid]
-
-    for _ in range(max_depth):
-        next_level: list[int] = []
-        for parent_pid in current_level:
-            children = get_child_pids(parent_pid)
-            pids.extend(children)
-            next_level.extend(children)
-        current_level = next_level
-        if not current_level:
-            break
-
-    return pids
-
-
-def get_all_thread_ids(pid: int) -> list[int]:
-    thread_ids: list[int] = []
-    task_dir = f"/proc/{pid}/task"
-
-    if not os.path.exists(task_dir):
-        return thread_ids
-
-    try:
-        for tid_str in os.listdir(task_dir):
-            try:
-                tid = int(tid_str)
-                thread_ids.append(tid)
-            except ValueError:
-                continue
-    except (OSError, PermissionError):
-        pass
-
-    return thread_ids
-
-
-def get_process_group_pids(pid: int) -> list[int]:
-    try:
-        pgid = os.getpgid(pid)
-        result = subprocess.run(
-            ["pgrep", "-g", str(pgid)],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            return [int(p) for p in result.stdout.strip().split("\n") if p]
-    except (OSError, ValueError, subprocess.CalledProcessError):
-        pass
-    return []
-
-
-def get_all_threads_for_processes(pids: list[int]) -> list[int]:
-    all_threads: list[int] = []
-    for pid in pids:
-        threads = get_all_thread_ids(pid)
-        all_threads.extend(threads)
-        if pid not in all_threads:
-            all_threads.append(pid)
-    return all_threads
-
-
-def kill_all_spec_processes():
-    commands = [
-        "sudo pkill -f runspec",
-        "sudo pkill -f specinvoke",
-        "sudo pkill -f specmake",
-        "sudo pkill -f run_base",
-    ]
-
-    for cmd in commands:
-        try:
-            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-
-    print("Killed all SPEC processes")
 
 
 def get_available_cores_from_mask(mask_hex: str, max_core: int) -> list[int]:
@@ -278,16 +184,46 @@ def measure_lc_tail_latency_ms_from_bpf_map(latency_map_path: str) -> float | No
     return ms
 
 
-def read_thread_cpu_time(tid: int) -> int | None:
-    stat_path = f"/proc/{tid}/stat"
+def clear_lc_tail_latency_in_bpf_map(latency_map_path: str) -> bool:
+    """Reset pinned latency map value (key 0) to 0 before next sampling window."""
+    if not latency_map_path or not os.path.exists(latency_map_path):
+        return False
+
+    cmd = [
+        "sudo",
+        "bpftool",
+        "map",
+        "update",
+        "pinned",
+        latency_map_path,
+        "key",
+        "0",
+        "0",
+        "0",
+        "0",
+        "value",
+        "0",
+        "0",
+        "0",
+        "0",
+    ]
+
     try:
-        with open(stat_path, "r") as f:
-            data = f.read().split()
-        utime = int(data[13])
-        stime = int(data[14])
-        return utime + stime
-    except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError, ValueError):
-        return None
+        subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        err = getattr(e, "stderr", None)
+        if err:
+            print(f"Failed to clear latency map via bpftool: {err.strip()}")
+        else:
+            print("Failed to clear latency map via bpftool")
+        return False
 
 
 def measure_lc_load(
@@ -351,7 +287,7 @@ def run(
     else:
         raise Exception("Invalid pressure level, only [low / medium / high] are supported")
 
-    taskset_cmd = f"taskset {CORE_MASK_HEX[num_cores]}"
+    taskset_cmd = f"taskset {CORE_MASK_HEX[int(num_cores)]}"
 
     if LC_type == "masstree":
         lats_bin = TailbenchDir / "masstree" / "lats.bin"
@@ -360,12 +296,12 @@ def run(
         MAXREQS = QPS * 60
         WARMUPREQS = QPS
         MINSLEEPNS = 100
-        NTHREADS = os.environ.get("NTHREADS", "10")
+        NTHREADS = str(num_cores)
 
         LC_cmd = (
             f"bash -c 'sleep 10 && cd {masstree_dir} && "
             f"TBENCH_QPS={QPS} TBENCH_MAXREQS={MAXREQS} TBENCH_WARMUPREQS={WARMUPREQS} "
-            f"TBENCH_MINSLEEPNS={MINSLEEPNS} {taskset_cmd}"
+            f"TBENCH_MINSLEEPNS={MINSLEEPNS} {taskset_cmd} "
             f"./mttest_integrated -j{NTHREADS} mycsba masstree'"
         )
 
@@ -391,23 +327,7 @@ def run(
 
     spec_dir = os.path.expanduser("/home/dell-07/wltu/speccpu2006-v1.0.1")
 
-    # Build taskset command based on num_cores or NUMA_unaware
-    taskset_cmd = ""
-    if NUMA_unaware:
-        # Use NUMA0 cores (even cores)
-        if (not num_cores) or (num_cores == 10):
-            num_cores = int(10)
-            taskset_cmd = f"taskset 0x1111111111 "
-        elif num_cores == 5:
-            taskset_cmd = f"taskset 0x1010101010 "
-        elif num_cores == 15:
-            taskset_cmd = f"taskset 0x5555511111 "
-        elif num_cores == 20:
-            taskset_cmd = f"taskset 0x5555555555 "
-        else:
-            raise Exception("Invalid num_cores")
-    else:
-        raise Exception("Invalid num_cores")
+    taskset_cmd = f"taskset {CORE_MASK_HEX[int(num_cores)]}"
 
     if NUMA_unaware:
         # Add 10s sleep to allow scheduler to process ring buffer
@@ -464,6 +384,8 @@ def run(
         available_cores=available_cores,
     )
     set_be_thread_count(total_cores - lc_cores)
+    if clear_lc_tail_latency_in_bpf_map(latency_map_path):
+        print("Initialized latency map to 0 before control loop.")
 
     print("Entering control loop for core partitioning...")
 
@@ -481,16 +403,29 @@ def run(
         else:
             print("Latency not available yet, skipping this interval.")
             continue
+
+        # A zero value means scheduler hasn't published a fresh sample yet.
+        # Keep all cores on LC and do not allocate any core to BE before startup.
+        if measured_latency_ms <= 0:
+            if lc_cores != total_cores:
+                lc_cores = total_cores
+                apply_core_partition(
+                    lc_root_pid=lc_process.pid,
+                    be_root_pid=be_process.pid,
+                    lc_cores=lc_cores,
+                    total_cores=total_cores,
+                    available_cores=available_cores,
+                )
+                set_be_thread_count(0)
+            print("Latency is 0 (startup/no fresh sample yet), keep BE cores at 0.")
+            continue
+
         lc_load, last_cpu_times = measure_lc_load(
             lc_root_pid=lc_process.pid,
             total_cores=total_cores,
             last_cpu_times=last_cpu_times,
             interval_sec=CONTROL_INTERVAL_SEC,
         )
-
-        if measured_latency_ms is None:
-            print("Latency not available yet, skipping this interval.")
-            continue
 
         print(
             f"Latency source={latency_source}, p99={measured_latency_ms:.3f} ms "
@@ -715,8 +650,8 @@ if __name__ == "__main__":
         if args.BE:
             print('Warning : "run all" is set, ignoring given BE')
         for BE_type in SPEC_2006_BE_list:
-            run(LC_type, BE_type, num_cores, args.NUMA_unaware, pressure, args.latency_map_path)
+            run(LC_type, BE_type, args.num_cores, args.NUMA_unaware, args.pressure, args.latency_map_path)
         exit()
 
-    run(LC_type, args.BE, num_cores, args.NUMA_unaware, pressure, args.latency_map_path)
+    run(LC_type, args.BE, args.num_cores, args.NUMA_unaware, args.pressure, args.latency_map_path)
     

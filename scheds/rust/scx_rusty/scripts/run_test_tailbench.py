@@ -13,11 +13,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from be_throughput_perf import parse_perf_stat_csv, throughput_monitor_worker
-
-TailbenchDir = Path("/home/dell-07/wltu/Tailbench/tailbench")
-SPEC_2006_BE_list = ["400.perlbench", "401.bzip2", "403.gcc", "429.mcf", "445.gobmk", "456.hmmer", "458.sjeng", "462.libquantum", "464.h264ref", "473.astar", "483.xalancbmk"]
-First_SMT_silibing_core_ID = 20 # Hard coded
-Num_total_cores = 40 # with SMT counted
+from tailbench_common import (
+    CORE_MASK_HEX,
+    Num_total_cores,
+    SPEC_2006_BE_list,
+    TailbenchDir,
+    get_all_thread_ids,
+    get_all_threads_for_processes,
+    get_descendant_pids,
+    get_process_group_pids,
+    kill_all_spec_processes,
+    read_thread_cpu_time,
+)
 
 QPS_limit_masstree = {
    10 : 11700,
@@ -28,13 +35,6 @@ QPS_limit_masstree = {
 
 QPS_limit_specjbb = {
    10 : 15000, # tested
-}
-
-CORE_MASK_HEX = {
-    10: "0x1111111111",
-    5: "0x1010101010",
-    15: "0x5555511111",
-    20: "0x5555555555",
 }
 
 def generate_even_string(x):
@@ -196,83 +196,6 @@ def write_task_type_update(map_fd, pid, task_type):
     
     return True
 
-def get_child_pids(pid):
-    """Get all child PIDs of a process"""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-P", str(pid)],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        pids = [int(p) for p in result.stdout.strip().split('\n') if p]
-        return pids
-    except (subprocess.CalledProcessError, ValueError):
-        return []
-
-def get_descendant_pids(pid, max_depth=3):
-    """Get all descendant PIDs of a process (recursively)"""
-    pids = []
-    current_level = [pid]
-    
-    for depth in range(max_depth):
-        next_level = []
-        for parent_pid in current_level:
-            children = get_child_pids(parent_pid)
-            pids.extend(children)
-            next_level.extend(children)
-        current_level = next_level
-        if not current_level:
-            break
-    
-    return pids
-
-def get_all_thread_ids(pid):
-    """Get all thread IDs (TIDs) for a process, including the main thread"""
-    thread_ids = []
-    task_dir = f"/proc/{pid}/task"
-    
-    if not os.path.exists(task_dir):
-        return thread_ids
-    
-    try:
-        for tid_str in os.listdir(task_dir):
-            try:
-                tid = int(tid_str)
-                thread_ids.append(tid)
-            except ValueError:
-                continue
-    except (OSError, PermissionError):
-        pass
-    
-    return thread_ids
-
-def get_process_group_pids(pid):
-    """Get all PIDs in the same process group as the given PID"""
-    try:
-        pgid = os.getpgid(pid)
-        result = subprocess.run(
-            ["pgrep", "-g", str(pgid)],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            return [int(p) for p in result.stdout.strip().split('\n') if p]
-    except (OSError, ValueError, subprocess.CalledProcessError):
-        pass
-    return []
-
-def get_all_threads_for_processes(pids):
-    """Get all thread IDs for a list of process PIDs"""
-    all_threads = []
-    for pid in pids:
-        threads = get_all_thread_ids(pid)
-        all_threads.extend(threads)
-        # Also include the PID itself (main thread TID == PID)
-        if pid not in all_threads:
-            all_threads.append(pid)
-    return all_threads
-
 def collect_and_write_be_threads(map_fd, be_process_pid, BE_type, debug_mode=False):
     """One-time collect BE process threads and write them to the ring buffer (or print in debug mode)"""
     try:
@@ -327,23 +250,6 @@ def collect_and_write_be_threads(map_fd, be_process_pid, BE_type, debug_mode=Fal
         else:
             print(f"Error in BE thread collection: {e}")
 
-def kill_all_spec_processes():
-    """Kill all runspec and benchmark processes"""
-    commands = [
-        "sudo pkill -f runspec",
-        "sudo pkill -f specinvoke", 
-        "sudo pkill -f specmake",
-        "sudo pkill -f run_base"
-    ]
-    
-    for cmd in commands:
-        try:
-            subprocess.run(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except:
-            pass
-    
-    print("Killed all SPEC processes")
-
 def collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_mode=False):
     # Recursively collect and write BE process PIDs and sub-process PIDs to ring buffer (one-time)
     if map_fd is not None or debug_mode:
@@ -397,18 +303,6 @@ def collect_and_write_be_process_and_sub_process_pids(map_fd, be_process, debug_
             print(f"BE Process PIDs: {unique_be_pids}")
             print(f"BE Thread IDs: {sorted(set(be_threads))}")
 
-def read_thread_cpu_time(tid: int) -> int | None:
-    stat_path = f"/proc/{tid}/stat"
-    try:
-        with open(stat_path, "r") as f:
-            data = f.read().split()
-        utime = int(data[13])
-        stime = int(data[14])
-        return utime + stime
-    except (FileNotFoundError, ProcessLookupError, PermissionError, IndexError, ValueError):
-        return None
-
-
 def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None, debug_mode=False):
     os.makedirs(LC_type, exist_ok=True)
     os.makedirs(f"{LC_type}/{pressure}", exist_ok=True)
@@ -434,13 +328,13 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
         MAXREQS = QPS * 60
         WARMUPREQS = QPS
         MINSLEEPNS = 100
-        NTHREADS = os.environ.get("NTHREADS", "10")
+        NTHREADS = str(num_cores)
         
         # Construct masstree command with 10s sleep to allow scheduler to process ring buffer
         LC_cmd = (
             f"bash -c 'sleep 10 && cd {masstree_dir} && "
             f"TBENCH_QPS={QPS} TBENCH_MAXREQS={MAXREQS} TBENCH_WARMUPREQS={WARMUPREQS} "
-            f"TBENCH_MINSLEEPNS={MINSLEEPNS} {taskset_cmd}"
+            f"TBENCH_MINSLEEPNS={MINSLEEPNS} {taskset_cmd} "
             f"./mttest_integrated -j{NTHREADS} mycsba masstree'"
         )
 
@@ -721,12 +615,6 @@ if __name__ == "__main__":
     
     # num_cores == None means we do not bind cores
     num_cores = None
-
-    if args.num_cores:
-        num_cores = args.num_cores
-        if args.NUMA_unaware:
-            raise Exception("\"NUMA_unaware\" is set but \"num_cores\" is also set, which is not valid")
-
     if not args.LC:
         raise Exception("No LC is given.")
     LC_type = args.LC
@@ -738,8 +626,8 @@ if __name__ == "__main__":
         if args.BE:
             print("Warning : \"run all\" is set, ignoring given BE")
         for BE_type in SPEC_2006_BE_list:
-            run(LC_type, BE_type, num_cores, args.NUMA_unaware, pressure, args.task_type_shm, args.debug)
+            run(LC_type, BE_type, args.num_cores, args.NUMA_unaware, args.pressure, args.task_type_shm, args.debug)
         exit()
 
-    run(LC_type, args.BE, num_cores, args.NUMA_unaware, pressure, args.task_type_shm, args.debug)
+    run(LC_type, args.BE, args.num_cores, args.NUMA_unaware, args.pressure, args.task_type_shm, args.debug)
     
