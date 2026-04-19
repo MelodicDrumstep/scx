@@ -87,7 +87,10 @@ const volatile u32 greedy_threshold_x_numa;
 const volatile u32 rusty_perf_mode;
 const volatile u32 debug;
 
-const u32 BE_DISPATCH_PROB = 80; // 80% probability to check for BE task
+/* ~80% probability to enter BE-dispatch checks (see rusty_dispatch). Set from userspace. */
+const volatile u32 be_dispatch_prob = 80;
+/* Cooldown after BE kick (nanoseconds). Default 1200ms. Set from userspace. */
+const volatile u64 be_kick_cooldown_ns = 1200000000ULL;
 
 /* base slice duration */
 volatile u64 slice_ns;
@@ -539,9 +542,6 @@ struct {
 	__uint(map_flags, 0);
 } high_latency_flag SEC(".maps");
 
-/* Cooldown period after BE kick: 1000ms in nanoseconds */
-#define BE_KICK_COOLDOWN_NS 1000000000ULL
-
 static inline void stat_add(enum stat_idx idx, u64 addend)
 {
 	u32 idx_v = idx;
@@ -777,7 +777,7 @@ static bool is_be_dispatch_allowed(void)
 	const u32 zero = 0;
 	u64 now = scx_bpf_now();
 	u64 *last_kick_time;
-	u64 cooldown_ns = BE_KICK_COOLDOWN_NS;
+	u64 cooldown_ns = be_kick_cooldown_ns;
 
 	last_kick_time = bpf_map_lookup_elem(&last_be_kick_timestamp, &zero);
 	if (!last_kick_time)
@@ -1871,11 +1871,11 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 	bool can_dispatch_be = false;
 	
 	/* Check if current CPU has no LC task running */
-	/* Use deterministic probability: check on CPUs where (cpu % 4 == 0) and (cpu % 100 < BE_DISPATCH_PROB) */
-	/* This gives approximately BE_DISPATCH_PROB% probability across eligible CPUs */
+	/* Use deterministic probability: check on CPUs where (cpu % 4 == 0) and (cpu % 100 < be_dispatch_prob) */
+	/* This gives approximately be_dispatch_prob% probability across eligible CPUs */
 	/* Cast to u32 to avoid signed division error */
 
-	if ((cpu_u % 4) == 0 && (bpf_get_prandom_u32() % 100) < BE_DISPATCH_PROB) {
+	if ((cpu_u % 4) == 0 && (bpf_get_prandom_u32() % 100) < be_dispatch_prob) {
 		/* Check if BE dispatch is allowed (not within cooldown period after BE kick) */
 		if (!is_be_dispatch_allowed()) {
 			// bpf_printk("[dispatch] BE dispatch blocked due to cooldown period on CPU %d", cpu);

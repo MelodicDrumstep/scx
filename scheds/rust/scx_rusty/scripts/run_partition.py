@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -34,13 +35,53 @@ QPS_limit_specjbb = {
 
 # Control policy parameters (adjust as needed)
 CONTROL_INTERVAL_SEC = 1.0
-LC_P99_HIGH_MS = 1.6
-LC_P99_LOW_MS = 1.2
+LC_P99_HIGH_MS = 1.0
+LC_P99_LOW_MS = 0.8
 LC_MIN_CORES = 1
 
 DEFAULT_LATENCY_MAP_PATH = "/sys/fs/bpf/latency_map_path"
 
 CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+
+# After first SPEC BE (400.perlbench) under --run_all_SPEC: skip rest if end2end p99 exceeds this (ms).
+FIRST_BE_P99_SKIP_MS_HIGH = 3.0
+FIRST_BE_P99_SKIP_MS_MEDIUM_LOW = 2.0
+
+
+def extract_tailbench_end2end_p99_ms(lc_type: str) -> float | None:
+    """Parse end2end p99 latency (ms) from Tailbench lats.bin via parselats.py."""
+    if lc_type == "masstree":
+        lats_bin = TailbenchDir / "masstree" / "lats.bin"
+    elif lc_type == "specjbb":
+        lats_bin = TailbenchDir / "specjbb" / "lats.bin"
+    else:
+        return None
+    if not lats_bin.is_file():
+        return None
+    parse_cmd = [
+        "python3",
+        str(TailbenchDir / "utilities" / "parselats.py"),
+        str(lats_bin),
+    ]
+    try:
+        result = subprocess.run(
+            parse_cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    output = result.stdout
+    pattern = r"end2end:.*?p99\s+([\d.]+)\s+ms"
+    match = re.search(pattern, output, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    pattern2 = r"p99[:\s]+([\d.]+)\s*ms"
+    match2 = re.search(pattern2, output, re.IGNORECASE)
+    if match2:
+        return float(match2.group(1))
+    return None
 
 
 def get_available_cores_from_mask(mask_hex: str, max_core: int) -> list[int]:
@@ -273,6 +314,8 @@ def run(
     NUMA_unaware: bool,
     pressure: str,
     latency_map_path: str,
+    lc_p99_low_ms: float,
+    lc_p99_high_ms: float,
 ):
     os.makedirs(LC_type, exist_ok=True)
     os.makedirs(f"{LC_type}/{pressure}", exist_ok=True)
@@ -429,7 +472,7 @@ def run(
 
         print(
             f"Latency source={latency_source}, p99={measured_latency_ms:.3f} ms "
-            f"(low={LC_P99_LOW_MS:.3f}, high={LC_P99_HIGH_MS:.3f}), "
+            f"(low={lc_p99_low_ms:.3f}, high={lc_p99_high_ms:.3f}), "
             f"LC_load={lc_load:.3f}, "
             f"LC_cores={lc_cores}, BE_cores={total_cores - lc_cores}",
         )
@@ -437,7 +480,7 @@ def run(
         be_cores = total_cores - lc_cores
 
         # If LC latency is low, give one more core to BE.
-        if measured_latency_ms < LC_P99_LOW_MS:
+        if measured_latency_ms < lc_p99_low_ms:
             if lc_cores > LC_MIN_CORES:
                 lc_cores = max(lc_cores - 1, LC_MIN_CORES)
                 apply_core_partition(
@@ -451,7 +494,7 @@ def run(
             continue
 
         # If LC latency is high, give one more core to LC.
-        if measured_latency_ms > LC_P99_HIGH_MS:
+        if measured_latency_ms > lc_p99_high_ms:
             if be_cores > 0:
                 lc_cores = min(lc_cores + 1, total_cores)
                 apply_core_partition(
@@ -629,6 +672,18 @@ if __name__ == "__main__":
         default=DEFAULT_LATENCY_MAP_PATH,
         help='Pinned BPF map path that stores newest LC p99 latency (ns), e.g. "/sys/fs/bpf/latency_map_path"',
     )
+    parser.add_argument(
+        "--lc-p99-low-ms",
+        type=float,
+        default=LC_P99_LOW_MS,
+        help="LC p99 low threshold in ms; below this, one core is moved from LC to BE",
+    )
+    parser.add_argument(
+        "--lc-p99-high-ms",
+        type=float,
+        default=LC_P99_HIGH_MS,
+        help="LC p99 high threshold in ms; above this, one core is moved from BE to LC",
+    )
     args = parser.parse_args()
 
     if args.pressure:
@@ -646,12 +701,54 @@ if __name__ == "__main__":
     if (not args.run_all_SPEC) and (not args.BE):
         raise Exception("No BE is given.")
 
+    if args.lc_p99_low_ms < 0 or args.lc_p99_high_ms < 0:
+        raise Exception("lc p99 thresholds must be non-negative")
+    if args.lc_p99_low_ms >= args.lc_p99_high_ms:
+        raise Exception("lc-p99-low-ms must be smaller than lc-p99-high-ms")
+
     if args.run_all_SPEC:
         if args.BE:
             print('Warning : "run all" is set, ignoring given BE')
-        for BE_type in SPEC_2006_BE_list:
-            run(LC_type, BE_type, args.num_cores, args.NUMA_unaware, args.pressure, args.latency_map_path)
+        first_be = SPEC_2006_BE_list[0]
+        if pressure == "high":
+            first_be_p99_skip_ms = FIRST_BE_P99_SKIP_MS_HIGH
+        else:
+            first_be_p99_skip_ms = FIRST_BE_P99_SKIP_MS_MEDIUM_LOW
+        for idx, BE_type in enumerate(SPEC_2006_BE_list):
+            run(
+                LC_type,
+                BE_type,
+                args.num_cores,
+                args.NUMA_unaware,
+                args.pressure,
+                args.latency_map_path,
+                args.lc_p99_low_ms,
+                args.lc_p99_high_ms,
+            )
+            if idx == 0 and BE_type == first_be:
+                p99_ms = extract_tailbench_end2end_p99_ms(LC_type)
+                if p99_ms is None:
+                    print(
+                        "Warning: could not read end2end p99 after first BE; "
+                        "continuing with remaining SPEC benchmarks."
+                    )
+                elif p99_ms > first_be_p99_skip_ms:
+                    print(
+                        f"First BE ({first_be}) end2end p99={p99_ms:.3f} ms "
+                        f"> {first_be_p99_skip_ms} ms (pressure={pressure}); "
+                        "skipping all remaining SPEC benchmarks."
+                    )
+                    break
         exit()
 
-    run(LC_type, args.BE, args.num_cores, args.NUMA_unaware, args.pressure, args.latency_map_path)
+    run(
+        LC_type,
+        args.BE,
+        args.num_cores,
+        args.NUMA_unaware,
+        args.pressure,
+        args.latency_map_path,
+        args.lc_p99_low_ms,
+        args.lc_p99_high_ms,
+    )
     

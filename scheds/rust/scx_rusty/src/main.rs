@@ -246,6 +246,18 @@ struct Opts {
     #[clap(long, value_name = "PATH", hide = true)]
     task_type_shm: Option<PathBuf>,
 
+    /// Cooldown after a BE kick before BE dispatch is allowed again (milliseconds).
+    #[clap(long, default_value = "1200")]
+    be_kick_cooldown_ms: u64,
+
+    /// Approximate probability (0–100) to run BE-dispatch checks on eligible CPUs.
+    #[clap(long, default_value = "80")]
+    be_dispatch_prob: u32,
+
+    /// Latency map sample (nanoseconds) above this marks high latency in BPF.
+    #[clap(long, default_value = "1800000")]
+    latency_threshold_ns: u32,
+
     #[clap(flatten, next_help_heading = "Libbpf Options")]
     pub libbpf: LibbpfOpts,
 }
@@ -373,6 +385,7 @@ struct Scheduler<'a> {
     latency_map_fd: Option<i32>,  // File descriptor for external latency map
     latency_check_interval: Duration,
     next_latency_check: Instant,
+    latency_threshold_ns: u32,
 }
 
 impl<'a> Scheduler<'a> {
@@ -489,6 +502,10 @@ impl<'a> Scheduler<'a> {
         rodata.mempolicy_affinity = opts.mempolicy_affinity;
         rodata.debug = opts.verbose as u32;
         rodata.rusty_perf_mode = opts.perf;
+        rodata.be_kick_cooldown_ns = opts
+            .be_kick_cooldown_ms
+            .saturating_mul(1_000_000);
+        rodata.be_dispatch_prob = opts.be_dispatch_prob.min(100);
 
         // Attach.
         let mut skel = scx_ops_load!(skel, rusty, uei)?;
@@ -572,6 +589,7 @@ impl<'a> Scheduler<'a> {
             latency_map_fd,
             latency_check_interval: Duration::from_millis(1000), // Check every 1000ms
             next_latency_check: Instant::now(),
+            latency_threshold_ns: opts.latency_threshold_ns,
         })
     }
 
@@ -660,8 +678,8 @@ impl<'a> Scheduler<'a> {
     }
 
     fn check_latency(&mut self) -> Result<()> {
-        const LATENCY_THRESHOLD_NS: u32 = 2200000;
         const MAP_KEY: u32 = 0;
+        let threshold_ns = self.latency_threshold_ns;
         
         // Track initialization state
         static mut FIRST_CALL: bool = true;
@@ -708,7 +726,7 @@ impl<'a> Scheduler<'a> {
                 // info!("Latency value: {} ns", latency_value);
                 // Check if this is the first successful read after initialization
                 
-                let high_latency = latency_value > LATENCY_THRESHOLD_NS;
+                let high_latency = latency_value > threshold_ns;
     
                 // Update high latency flag in BPF map
                 let flag_map = &self.skel.maps.high_latency_flag;
@@ -721,7 +739,7 @@ impl<'a> Scheduler<'a> {
     
                 if high_latency {
                     info!("High latency detected: {} ns (threshold: {} ns)", 
-                          latency_value, LATENCY_THRESHOLD_NS);
+                          latency_value, threshold_ns);
                 }
             } else {
                 // Failed to read latency map (might not exist yet or was closed)
