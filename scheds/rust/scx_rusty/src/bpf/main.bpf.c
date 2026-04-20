@@ -87,8 +87,6 @@ const volatile u32 greedy_threshold_x_numa;
 const volatile u32 rusty_perf_mode;
 const volatile u32 debug;
 
-/* ~80% probability to enter BE-dispatch checks (see rusty_dispatch). Set from userspace. */
-const volatile u32 be_dispatch_prob = 80;
 /* Cooldown after BE kick (nanoseconds). Default 1200ms. Set from userspace. */
 const volatile u64 be_kick_cooldown_ns = 1200000000ULL;
 
@@ -1875,7 +1873,7 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 	/* This gives approximately be_dispatch_prob% probability across eligible CPUs */
 	/* Cast to u32 to avoid signed division error */
 
-	if ((cpu_u % 4) == 0 && (bpf_get_prandom_u32() % 100) < be_dispatch_prob) {
+	if ((cpu_u % 4) == 0) {
 		/* Check if BE dispatch is allowed (not within cooldown period after BE kick) */
 		if (!is_be_dispatch_allowed()) {
 			// bpf_printk("[dispatch] BE dispatch blocked due to cooldown period on CPU %d", cpu);

@@ -24,7 +24,6 @@ SPEC_2006_BE_list = [
     "462.libquantum",
     "464.h264ref",
     "473.astar",
-    "483.xalancbmk",
 ]
 
 First_SMT_silibing_core_ID = 20
@@ -44,7 +43,7 @@ def build_be_cmd(be_type: str, num_cores: int | None, numa_unaware: bool) -> str
         else:
             raise Exception("Invalid num_cores")
         return (
-            f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && "
+            f"bash -c 'sleep 5 && cd {spec_dir} && . ./shrc && "
             f"{taskset_cmd} "
             f"runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(Num_total_cores / 4)} {be_type}'"
         )

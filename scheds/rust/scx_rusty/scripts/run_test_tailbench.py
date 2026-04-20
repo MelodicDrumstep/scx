@@ -1,7 +1,9 @@
+#!/usr/bin/env python3
 import argparse
 import ctypes
 import ctypes.util
 import os
+import re
 import signal
 import struct
 import subprocess
@@ -36,6 +38,47 @@ QPS_limit_masstree = {
 QPS_limit_specjbb = {
    10 : 15000, # tested
 }
+
+# After first SPEC BE (400.perlbench) under --run_all_SPEC: skip rest if end2end p99 exceeds this (ms).
+FIRST_BE_P99_SKIP_MS_HIGH = 3.0
+FIRST_BE_P99_SKIP_MS_MEDIUM_LOW = 2.0
+
+
+def extract_tailbench_end2end_p99_ms(lc_type: str) -> float | None:
+    """Parse end2end p99 latency (ms) from Tailbench lats.bin via parselats.py."""
+    if lc_type == "masstree":
+        lats_bin = TailbenchDir / "masstree" / "lats.bin"
+    elif lc_type == "specjbb":
+        lats_bin = TailbenchDir / "specjbb" / "lats.bin"
+    else:
+        return None
+    if not lats_bin.is_file():
+        return None
+    parse_cmd = [
+        "python3",
+        str(TailbenchDir / "utilities" / "parselats.py"),
+        str(lats_bin),
+    ]
+    try:
+        result = subprocess.run(
+            parse_cmd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    output = result.stdout
+    pattern = r"end2end:.*?p99\s+([\d.]+)\s+ms"
+    match = re.search(pattern, output, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    pattern2 = r"p99[:\s]+([\d.]+)\s*ms"
+    match2 = re.search(pattern2, output, re.IGNORECASE)
+    if match2:
+        return float(match2.group(1))
+    return None
+
 
 def generate_even_string(x):
     return ','.join(str(num) for num in range(0, x, 2))
@@ -325,14 +368,14 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
         lats_bin = TailbenchDir / "masstree" / "lats.bin"
         masstree_dir = TailbenchDir / "masstree"
         QPS = int(QPS_limit_masstree[num_cores] * pressure_num)
-        MAXREQS = QPS * 60
+        MAXREQS = QPS * 20
         WARMUPREQS = QPS
         MINSLEEPNS = 100
         NTHREADS = str(num_cores)
         
         # Construct masstree command with 10s sleep to allow scheduler to process ring buffer
         LC_cmd = (
-            f"bash -c 'sleep 10 && cd {masstree_dir} && "
+            f"bash -c 'sleep 5 && cd {masstree_dir} && "
             f"TBENCH_QPS={QPS} TBENCH_MAXREQS={MAXREQS} TBENCH_WARMUPREQS={WARMUPREQS} "
             f"TBENCH_MINSLEEPNS={MINSLEEPNS} {taskset_cmd} "
             f"./mttest_integrated -j{NTHREADS} mycsba masstree'"
@@ -347,9 +390,9 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
             print(f"ERROR: {run_sh} not found")
             return False
 
-        # sleep 10s first
+        # sleep 5s first
         LC_cmd = (
-            f"bash -c 'sleep 10 && cd {SPECJBB_DIR} && sudo {taskset_cmd} {run_sh} {qps}'"
+            f"bash -c 'sleep 5 && cd {SPECJBB_DIR} && sudo {taskset_cmd} {run_sh} {qps}'"
         )
 
         # DEBUG
@@ -364,7 +407,7 @@ def run(LC_type, BE_type, num_cores, NUMA_unaware, pressure, task_type_shm=None,
     
     if NUMA_unaware:
         # Add 10s sleep to allow scheduler to process ring buffer
-        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && {taskset_cmd} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(num_cores)} {BE_type}'"
+        BE_cmd = f"bash -c 'sleep 5 && cd {spec_dir} && . ./shrc && {taskset_cmd} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(num_cores)} {BE_type}'"
 
     print(f"LC_cmd : {LC_cmd}, BE_cmd : {BE_cmd}")
 
@@ -604,6 +647,14 @@ if __name__ == "__main__":
     parser.add_argument('--task-type-shm', type = str, help = 'Path to the BPF map for task type ring buffer (e.g., /sys/fs/bpf/scx_rusty_task_types)')
     parser.add_argument('--debug', action = 'store_true', help = 'Debug mode: print BE thread IDs with timestamps instead of writing to BPF map')
     parser.add_argument('-p', '--pressure', type =str, choices = ['low', 'medium', 'high'], help = 'The pressure level to set for the LC process, [low / medium / high]')
+    
+    # New arguments for skip logic configuration
+    parser.add_argument('--disable-skip', action = 'store_true', help = 'Disable skipping remaining BE benchmarks even if first BE fails the latency threshold')
+    parser.add_argument('--skip-threshold-high', type = float, default = FIRST_BE_P99_SKIP_MS_HIGH, 
+                        help = f'P99 latency threshold (ms) for high pressure to trigger skip (default: {FIRST_BE_P99_SKIP_MS_HIGH})')
+    parser.add_argument('--skip-threshold-medium-low', type = float, default = FIRST_BE_P99_SKIP_MS_MEDIUM_LOW, 
+                        help = f'P99 latency threshold (ms) for medium/low pressure to trigger skip (default: {FIRST_BE_P99_SKIP_MS_MEDIUM_LOW})')
+    
     args = parser.parse_args()
 
     if args.pressure:
@@ -625,9 +676,48 @@ if __name__ == "__main__":
     if args.run_all_SPEC:
         if args.BE:
             print("Warning : \"run all\" is set, ignoring given BE")
-        for BE_type in SPEC_2006_BE_list:
-            run(LC_type, BE_type, args.num_cores, args.NUMA_unaware, args.pressure, args.task_type_shm, args.debug)
+        
+        # Check if skip is disabled
+        if args.disable_skip:
+            print("Skip logic is DISABLED - will run all SPEC benchmarks regardless of first BE performance")
+            for BE_type in SPEC_2006_BE_list:
+                run(LC_type, BE_type, args.num_cores, args.NUMA_unaware, args.pressure, args.task_type_shm, args.debug)
+        else:
+            # Skip logic is enabled
+            print(f"Skip logic is ENABLED - will check first BE ({SPEC_2006_BE_list[0]}) performance")
+            
+            # Use custom thresholds if provided
+            if pressure == "high":
+                first_be_p99_skip_ms = args.skip_threshold_high
+            else:
+                first_be_p99_skip_ms = args.skip_threshold_medium_low
+            
+            print(f"Skip threshold for {pressure} pressure: {first_be_p99_skip_ms} ms")
+            
+            first_be = SPEC_2006_BE_list[0]
+            for idx, BE_type in enumerate(SPEC_2006_BE_list):
+                run(LC_type, BE_type, args.num_cores, args.NUMA_unaware, args.pressure, args.task_type_shm, args.debug)
+                
+                # Only check skip condition after first BE
+                if idx == 0 and BE_type == first_be:
+                    p99_ms = extract_tailbench_end2end_p99_ms(LC_type)
+                    if p99_ms is None:
+                        print(
+                            "Warning: could not read end2end p99 after first BE; "
+                            "continuing with remaining SPEC benchmarks."
+                        )
+                    elif p99_ms > first_be_p99_skip_ms:
+                        print(
+                            f"First BE ({first_be}) end2end p99={p99_ms:.3f} ms "
+                            f"> {first_be_p99_skip_ms} ms (pressure={pressure}); "
+                            "skipping all remaining SPEC benchmarks."
+                        )
+                        break
+                    else:
+                        print(
+                            f"First BE ({first_be}) end2end p99={p99_ms:.3f} ms "
+                            f"<= {first_be_p99_skip_ms} ms; continuing with remaining benchmarks."
+                        )
         exit()
 
     run(LC_type, args.BE, args.num_cores, args.NUMA_unaware, args.pressure, args.task_type_shm, args.debug)
-    

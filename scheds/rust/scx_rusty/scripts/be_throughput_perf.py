@@ -144,7 +144,7 @@ def kill_be_tree(be_process: subprocess.Popen) -> None:
 
 def parse_perf_stat_csv(stderr_text: str) -> tuple[int | None, float | None]:
     """
-    Parse `perf stat -x,` stderr output.
+    Parse `perf stat` output (human-readable format like your example).
     Returns (instructions, seconds_elapsed).
     """
     instructions: int | None = None
@@ -152,26 +152,25 @@ def parse_perf_stat_csv(stderr_text: str) -> tuple[int | None, float | None]:
 
     for line in stderr_text.splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 2:
-            continue
-
-        event = parts[1]
-
-        if event == "instructions":
-            v = parts[0].replace(",", "").strip()
-            try:
-                instructions = int(float(v))
-            except ValueError:
-                continue
-
+        
+        # Match: "    61,345,867,000      instructions"
+        if "instructions" in line and not line.startswith("#"):
+            # Extract the number before "instructions"
+            parts = line.split()
+            if len(parts) >= 2:
+                num_str = parts[0].replace(",", "")
+                try:
+                    instructions = int(num_str)
+                except ValueError:
+                    pass
+        
+        # Match: "      63.708697853 seconds time elapsed"
         if "seconds time elapsed" in line:
-            v = parts[0].replace(",", "").strip()
-            try:
-                seconds_elapsed = float(v)
-            except ValueError:
-                continue
+            parts = line.split()
+            if len(parts) >= 1:
+                try:
+                    seconds_elapsed = float(parts[0])
+                except ValueError:
+                    pass
 
     return instructions, seconds_elapsed

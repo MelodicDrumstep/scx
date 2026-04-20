@@ -1,6 +1,7 @@
 import argparse
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -46,6 +47,46 @@ CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
 # After first SPEC BE (400.perlbench) under --run_all_SPEC: skip rest if end2end p99 exceeds this (ms).
 FIRST_BE_P99_SKIP_MS_HIGH = 3.0
 FIRST_BE_P99_SKIP_MS_MEDIUM_LOW = 2.0
+
+
+def clear_tailbench_masstree_latency_artifacts() -> None:
+    """Remove Tailbench masstree latency outputs so each run cannot reuse stale lats.bin."""
+    d = TailbenchDir / "masstree"
+    if not d.is_dir():
+        return
+    for name in ("lats.bin", "lats.txt"):
+        p = d / name
+        try:
+            if p.is_file():
+                p.unlink()
+        except OSError as e:
+            print(f"Warning: could not remove {p}: {e}")
+
+
+def clear_tailbench_specjbb_latency_artifacts() -> None:
+    """Remove Tailbench specjbb latency outputs (same rationale as masstree)."""
+    d = TailbenchDir / "specjbb"
+    if not d.is_dir():
+        return
+    for name in ("lats.bin", "lats.txt"):
+        p = d / name
+        try:
+            if p.is_file():
+                p.unlink()
+        except OSError as e:
+            print(f"Warning: could not remove {p}: {e}")
+
+
+def _remove_latency_log_on_early_run_all_abort(
+    lc_type: str, pressure: str, first_be: str
+) -> None:
+    """When --run_all_SPEC aborts after the first BE, drop parselats output so nothing is left on disk."""
+    path = Path(lc_type) / pressure / first_be / "latency.log"
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError as e:
+        print(f"Warning: could not remove {path}: {e}")
 
 
 def extract_tailbench_end2end_p99_ms(lc_type: str) -> float | None:
@@ -316,10 +357,14 @@ def run(
     latency_map_path: str,
     lc_p99_low_ms: float,
     lc_p99_high_ms: float,
-):
+) -> bool | None:
+    """Run one LC+BE pair. Returns True if BE throughput was computed, False if unavailable after run, None on early failure."""
     os.makedirs(LC_type, exist_ok=True)
     os.makedirs(f"{LC_type}/{pressure}", exist_ok=True)
-    os.makedirs(f"{LC_type}/{pressure}/{BE_type}", exist_ok=True)
+    be_out_dir = Path(LC_type) / pressure / BE_type
+    if be_out_dir.exists():
+        shutil.rmtree(be_out_dir)
+    be_out_dir.mkdir(parents=True, exist_ok=True)
 
     if pressure == "low":
         pressure_num = 0.3
@@ -333,40 +378,39 @@ def run(
     taskset_cmd = f"taskset {CORE_MASK_HEX[int(num_cores)]}"
 
     if LC_type == "masstree":
+        clear_tailbench_masstree_latency_artifacts()
         lats_bin = TailbenchDir / "masstree" / "lats.bin"
         masstree_dir = TailbenchDir / "masstree"
         QPS = int(QPS_limit_masstree[num_cores] * pressure_num)
-        MAXREQS = QPS * 60
+        MAXREQS = QPS * 20
         WARMUPREQS = QPS
         MINSLEEPNS = 100
         NTHREADS = str(num_cores)
 
         LC_cmd = (
-            f"bash -c 'sleep 10 && cd {masstree_dir} && "
+            f"bash -c 'sleep 5 && cd {masstree_dir} && "
             f"TBENCH_QPS={QPS} TBENCH_MAXREQS={MAXREQS} TBENCH_WARMUPREQS={WARMUPREQS} "
             f"TBENCH_MINSLEEPNS={MINSLEEPNS} {taskset_cmd} "
             f"./mttest_integrated -j{NTHREADS} mycsba masstree'"
         )
 
     elif LC_type == "specjbb":
+        clear_tailbench_specjbb_latency_artifacts()
         lats_bin = TailbenchDir / "specjbb" / "lats.bin"
         SPECJBB_DIR = TailbenchDir / "specjbb"
         qps = int(QPS_limit_specjbb[num_cores] * pressure_num)
         run_sh = SPECJBB_DIR / "run.sh"
         if not run_sh.exists():
             print(f"ERROR: {run_sh} not found")
-            return False
+            return None
 
-        # sleep 10s first
+        # sleep 5s first
         LC_cmd = (
-            f"bash -c 'sleep 10 && cd {SPECJBB_DIR} && sudo {taskset_cmd} {run_sh} {qps}'"
+            f"bash -c 'sleep 5 && cd {SPECJBB_DIR} && sudo {taskset_cmd} {run_sh} {qps}'"
         )
 
     else:
         raise Exception("Unsupported LC_type")
-
-    if lats_bin.exists():
-        os.remove(str(lats_bin))
 
     spec_dir = os.path.expanduser("/home/dell-07/wltu/speccpu2006-v1.0.1")
 
@@ -374,7 +418,7 @@ def run(
 
     if NUMA_unaware:
         # Add 10s sleep to allow scheduler to process ring buffer
-        BE_cmd = f"bash -c 'sleep 10 && cd {spec_dir} && . ./shrc && {taskset_cmd} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(num_cores)} {BE_type}'"
+        BE_cmd = f"bash -c 'sleep 5 && cd {spec_dir} && . ./shrc && {taskset_cmd} runspec -c x86.cfg --size=test --iterations=1000 -v 9 -r {int(num_cores)} {BE_type}'"
 
     print(f"LC_cmd : {LC_cmd}, BE_cmd : {BE_cmd}")
 
@@ -390,7 +434,7 @@ def run(
         print(f"LC process PID: {lc_process.pid}")
     except Exception as e:
         print(f"Error running LC process: {e}")
-        return
+        return None
 
     print("Starting background processes (BE)...")
     be_process = subprocess.Popen(
@@ -590,7 +634,8 @@ def run(
             print(f"[DEBUG] Saved perf output to: {perf_out_path}")
         except Exception as e:
             print(f"Warning: failed to write perf output file: {e}")
-    if instructions is not None and used_time > 0:
+    be_throughput_available = instructions is not None and used_time > 0
+    if be_throughput_available:
         throughput = instructions / used_time
         print(
             f"BE throughput: instructions={instructions}, "
@@ -635,6 +680,7 @@ def run(
     kill_all_spec_processes()
 
     print("Execution completed")
+    return be_throughput_available
 
 
 if __name__ == "__main__":
@@ -715,7 +761,7 @@ if __name__ == "__main__":
         else:
             first_be_p99_skip_ms = FIRST_BE_P99_SKIP_MS_MEDIUM_LOW
         for idx, BE_type in enumerate(SPEC_2006_BE_list):
-            run(
+            be_tp = run(
                 LC_type,
                 BE_type,
                 args.num_cores,
@@ -726,6 +772,15 @@ if __name__ == "__main__":
                 args.lc_p99_high_ms,
             )
             if idx == 0 and BE_type == first_be:
+                if be_tp is False:
+                    print(
+                        f"First BE ({first_be}) finished with BE throughput unavailable; "
+                        "skipping all remaining SPEC benchmarks."
+                    )
+                    _remove_latency_log_on_early_run_all_abort(
+                        LC_type, pressure, first_be
+                    )
+                    break
                 p99_ms = extract_tailbench_end2end_p99_ms(LC_type)
                 if p99_ms is None:
                     print(
@@ -737,6 +792,9 @@ if __name__ == "__main__":
                         f"First BE ({first_be}) end2end p99={p99_ms:.3f} ms "
                         f"> {first_be_p99_skip_ms} ms (pressure={pressure}); "
                         "skipping all remaining SPEC benchmarks."
+                    )
+                    _remove_latency_log_on_early_run_all_abort(
+                        LC_type, pressure, first_be
                     )
                     break
         exit()

@@ -250,10 +250,6 @@ struct Opts {
     #[clap(long, default_value = "1200")]
     be_kick_cooldown_ms: u64,
 
-    /// Approximate probability (0–100) to run BE-dispatch checks on eligible CPUs.
-    #[clap(long, default_value = "80")]
-    be_dispatch_prob: u32,
-
     /// Latency map sample (nanoseconds) above this marks high latency in BPF.
     #[clap(long, default_value = "1800000")]
     latency_threshold_ns: u32,
@@ -505,7 +501,6 @@ impl<'a> Scheduler<'a> {
         rodata.be_kick_cooldown_ns = opts
             .be_kick_cooldown_ms
             .saturating_mul(1_000_000);
-        rodata.be_dispatch_prob = opts.be_dispatch_prob.min(100);
 
         // Attach.
         let mut skel = scx_ops_load!(skel, rusty, uei)?;

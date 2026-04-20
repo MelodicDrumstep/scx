@@ -4,6 +4,7 @@ set -euo pipefail
 # get LC and pressure from the command line
 LC=$1
 pressure=$2
+num_cores=$3
 
 # Directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,7 +23,6 @@ BE_TYPES=(
 "464.h264ref"
 "470.lbm"
 "473.astar"
-"483.xalancbmk"
 )
 
 SCHED_BIN="/home/dell-07/wltu/scx/target/release/scx_rusty"
@@ -49,7 +49,8 @@ for BE in "${BE_TYPES[@]}"; do
     --BE "${BE}" \
     --NUMA_unaware \
     --task-type-shm "${TASK_SHM}" \
-    -p ${pressure}
+    -p ${pressure} \
+    -n ${num_cores}
 
   # 3) After test finishes, kill scheduler if still running
   if ps -p "${RUSTY_PID}" > /dev/null 2>&1; then
