@@ -18,30 +18,34 @@ import argparse
 # Each tuple is (be_kick_cooldown_ms, latency_threshold_ns)
 # ============================================================
 PARAMETER_GRID: dict[str, List[Tuple[int, int]]] = {
-    # "high": [
-    #     (1200, 2200000),
-    #     (1000, 2000000),
-    #     (1000, 1800000),
-    #     (1000, 1600000),
-    #     (1000, 1200000),
-    #     (600, 1000000),
-    # ],
+    "high": [
+        (1000, 2500000),
+        (800, 2500000),
+        (200, 2000000),
+        (600, 2000000),
+        (300, 1800000),
+        (300, 1600000),
+        (200, 1600000),
+    ],
     "medium": [
         (300, 1800000),
-        # (1000, 1600000),
-        # (1000, 1400000),
-        # (1000, 1200000),
-        # (1000, 1000000),
-        # (600, 1000000),
+        (300, 1600000),
+        (200, 1600000),
+        (200, 1500000),
+        (300, 1000000),
+        (300, 800000),
+        (200, 600000),
+        (200, 400000),
     ],
-    # "low": [
-    #     (1000, 1400000),
-    #     (800, 1200000),
-    #     (800, 1100000),
-    #     (800, 1000000),
-    #     (800, 900000),
-    #     (600, 800000),
-    # ],
+    "low": [
+        (300, 1800000),
+        (300, 1600000),
+        (200, 1600000),
+        (200, 1500000),
+        (300, 800000),
+        (200, 600000),
+        (200, 400000),
+    ],
 }
 
 # ============================================================
@@ -93,7 +97,7 @@ def extract_performance_data(
     # Construct the extraction command
     cmd = [
         "sudo", "python3", "extract_masstree_perf.py",
-        "--root", f"masstree/{pressure}",
+        "--root", f"specjbb/{pressure}",
     ]
     
     print(f"[EXTRACT] Running performance extraction...")
@@ -216,7 +220,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Grid search for scx_rusty scheduler parameters"
     )
-    parser.add_argument("LC", type=str, help="LC value (e.g., masstree, sharded, etc.)")
+    parser.add_argument("LC", type=str, help="LC value (e.g., specjbb, sharded, etc.)")
     parser.add_argument("pressure", type=str, help="Pressure value (e.g., high, medium, low)")
     parser.add_argument("num_cores", type=int, help="Number of cores to use")
     parser.add_argument(

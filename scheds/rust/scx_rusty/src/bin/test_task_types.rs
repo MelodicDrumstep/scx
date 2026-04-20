@@ -426,7 +426,7 @@ fn main() -> Result<()> {
             done
             COUNTER=$((COUNTER + 1))
             echo "LC parent spawned {} threads (batch $COUNTER)"
-            sleep 10
+            sleep 5
         done
     "#, opts.num_lc_threads, opts.num_lc_threads, opts.num_lc_threads, opts.num_lc_threads, opts.num_lc_threads);
     
@@ -470,7 +470,7 @@ fn main() -> Result<()> {
             done
             COUNTER=$((COUNTER + 1))
             echo "BE parent spawned {} threads (batch $COUNTER)"
-            sleep 10
+            sleep 5
         done
     "#, opts.num_be_threads, opts.num_be_threads, opts.num_be_threads, opts.num_be_threads, opts.num_be_threads);
     

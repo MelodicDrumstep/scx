@@ -1194,9 +1194,9 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 	/* First pass: find CPUs that are idle, have no BE, and SMT sibling has no BE */
 	/* Only consider CPUs that are multiples of 4 (0, 4, 8, 12, ..., 36) */
 	for (i = 0; i < nr_cpu_ids; i++) {
-		/* Skip CPUs that are not multiples of 4 (cast to u32 to avoid signed division) */
-		if (((u32)i % 4) != 0)
-			continue;
+		// /* Skip CPUs that are not multiples of 4 (cast to u32 to avoid signed division) */
+		// if (((u32)i % 4) != 0)
+		// 	continue;
 
 		if (!bpf_cpumask_test_cpu(i, cast_mask(p_cpumask)))
 			continue;
@@ -1252,9 +1252,9 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 	/* Third pass: find any idle CPU with no BE, kick BE from both CPU and sibling if needed */
 	/* Only consider CPUs that are multiples of 4 (0, 4, 8, 12, ..., 36) */
 	for (i = 0; i < nr_cpu_ids; i++) {
-		/* Skip CPUs that are not multiples of 4 (cast to u32 to avoid signed division) */
-		if (((u32)i % 4) != 0)
-			continue;
+		// /* Skip CPUs that are not multiples of 4 (cast to u32 to avoid signed division) */
+		// if (((u32)i % 4) != 0)
+		// 	continue;
 
 		if (!bpf_cpumask_test_cpu(i, cast_mask(p_cpumask)))
 			continue;
@@ -1873,47 +1873,45 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 	/* This gives approximately be_dispatch_prob% probability across eligible CPUs */
 	/* Cast to u32 to avoid signed division error */
 
-	if ((cpu_u % 4) == 0) {
-		/* Check if BE dispatch is allowed (not within cooldown period after BE kick) */
-		if (!is_be_dispatch_allowed()) {
-			// bpf_printk("[dispatch] BE dispatch blocked due to cooldown period on CPU %d", cpu);
-			goto skip_be_dispatch;
-		}
+	/* Check if BE dispatch is allowed (not within cooldown period after BE kick) */
+	if (!is_be_dispatch_allowed()) {
+		// bpf_printk("[dispatch] BE dispatch blocked due to cooldown period on CPU %d", cpu);
+		goto skip_be_dispatch;
+	}
 
-		/* Check if high latency is detected - can be used to adjust scheduling behavior */
-		if (is_high_latency()) {
-			/* High latency detected - could adjust BE dispatch behavior here */
-			/* For example: reduce BE dispatch probability or delay BE tasks further */
-			// bpf_printk("[dispatch] High latency detected - could adjust BE dispatch behavior here");
-			goto skip_be_dispatch;
-		}
+	/* Check if high latency is detected - can be used to adjust scheduling behavior */
+	if (is_high_latency()) {
+		/* High latency detected - could adjust BE dispatch behavior here */
+		/* For example: reduce BE dispatch probability or delay BE tasks further */
+		// bpf_printk("[dispatch] High latency detected - could adjust BE dispatch behavior here");
+		goto skip_be_dispatch;
+	}
 
-		cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
-		if (cpu_task_type && *cpu_task_type == TASK_TYPE_UNINITIALIZED) {
-			/* Current CPU has no LC task running */
-			sibling = get_smt_sibling(cpu);
-			if (sibling >= 0) {
-				/* Has SMT sibling: check if sibling also has no LC task running */
-				cpu_sibling_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, sibling);
-				if (cpu_sibling_task_type && *cpu_sibling_task_type == TASK_TYPE_UNINITIALIZED) {
-					/* Both current CPU and SMT sibling have no LC task running */
-					can_dispatch_be = true;
-					// bpf_printk("[dispatch] We can dispatch BE task on CPU %d since CPU task type is %d and sibling task type is %d", cpu, *cpu_task_type, *cpu_sibling_task_type);
-				}
+	cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
+	if (cpu_task_type && *cpu_task_type == TASK_TYPE_UNINITIALIZED) {
+		/* Current CPU has no LC task running */
+		sibling = get_smt_sibling(cpu);
+		if (sibling >= 0) {
+			/* Has SMT sibling: check if sibling also has no LC task running */
+			cpu_sibling_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, sibling);
+			if (cpu_sibling_task_type && *cpu_sibling_task_type == TASK_TYPE_UNINITIALIZED) {
+				/* Both current CPU and SMT sibling have no LC task running */
+				can_dispatch_be = true;
+				// bpf_printk("[dispatch] We can dispatch BE task on CPU %d since CPU task type is %d and sibling task type is %d", cpu, *cpu_task_type, *cpu_sibling_task_type);
 			}
 		}
-		
-		if (can_dispatch_be) {
-			if (scx_bpf_dsq_move_to_local(PENDING_DSQ_ID)) {
-				stat_add(RUSTY_STAT_BE_DELAYED, 1);
-				// if (debug >= 2) {
-					// bpf_printk("[dispatch] Dispatched BE task from pending DSQ on CPU %d", cpu);
-				// }
-				update_cpu_running_task_type(cpu, TASK_TYPE_BE);
-				// DEBUGING
-				// bpf_printk("[dispatch] Update CPU %d task type to BE", cpu);
-				return;
-			}
+	}
+	
+	if (can_dispatch_be) {
+		if (scx_bpf_dsq_move_to_local(PENDING_DSQ_ID)) {
+			stat_add(RUSTY_STAT_BE_DELAYED, 1);
+			// if (debug >= 2) {
+				// bpf_printk("[dispatch] Dispatched BE task from pending DSQ on CPU %d", cpu);
+			// }
+			update_cpu_running_task_type(cpu, TASK_TYPE_BE);
+			// DEBUGING
+			// bpf_printk("[dispatch] Update CPU %d task type to BE", cpu);
+			return;
 		}
 	}
 skip_be_dispatch:

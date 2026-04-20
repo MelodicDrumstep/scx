@@ -20,10 +20,9 @@ First_SMT_silibing_core_ID = 20
 Num_total_cores = 40
 
 CORE_MASK_HEX = {
-    10: "0x1111111111",
-    5: "0x1010101010",
-    15: "0x5555511111",
-    20: "0x5555555555",
+    10: "0x3FF003FF",
+    15: "0x7FFF07FFF",
+    20: "0xFFFFFFFFFF",
 }
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run masstree + SPEC partition experiments while sweeping (--lc-p99-low-ms, --lc-p99-high-ms) pairs.
+Run specjbb + SPEC partition experiments while sweeping (--lc-p99-low-ms, --lc-p99-high-ms) pairs.
 
 Replaces the run_partition block in run_BE_benchmark.sh (lines 12–18) with configurable lists.
 
@@ -30,32 +30,39 @@ from pathlib import Path
 # Edit these lists to sweep threshold pairs per pressure level.
 P99_PAIRS_BY_PRESSURE: dict[str, list[tuple[float, float]]] = {
     "high": [
+        (0.7, 0.9),
         (0.8, 1.0),
         (0.9, 1.1),
-        (0.7, 0.9),
         (1.0, 1.2),
         (1.2, 1.5),
+        (1.5, 2.0)
     ],
     "medium": [
         (0.5, 0.7),
         (0.4, 0.6),
-        (0.5, 0.6)
+        (0.5, 0.6),
+        (0.6, 0.8),
+        (0.7, 0.9),
+        (0.8, 1.0),
     ],
     "low": [
         (0.3, 0.4),
-        (0.4, 0.8)
+        (0.4, 0.8),
+        (0.6, 0.8),
+        (0.7, 0.9),
+        (0.8, 1.0),
     ],
 }
 
 
 def _limits_file_suffix(low_ms: float, high_ms: float) -> str:
-    """Embed both p99 limits in artifact names (log + masstree dir)."""
+    """Embed both p99 limits in artifact names (log + specjbb dir)."""
     return f"lc-p99-low-{low_ms:g}-high-{high_ms:g}"
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Sweep lc p99 thresholds for run_partition.py (masstree + --run_all_SPEC)."
+        description="Sweep lc p99 thresholds for run_partition.py (specjbb + --run_all_SPEC)."
     )
     parser.add_argument(
         "num_cores",
@@ -96,9 +103,9 @@ def main() -> int:
 
     out_root = scripts_dir / "BE_throughput_result"
     out_root.mkdir(parents=True, exist_ok=True)
-    masstree_dir = scripts_dir / "masstree"
+    masstree_dir = scripts_dir / "specjbb"
 
-    # clean masstree dir up if there's data
+    # clean specjbb dir up if there's data
     if masstree_dir.is_dir():
         shutil.rmtree(masstree_dir)
 
@@ -125,7 +132,7 @@ def main() -> int:
                 "python3",
                 str(run_partition),
                 "--LC",
-                "masstree",
+                "specjbb",
                 "--run_all_SPEC",
                 "--NUMA_unaware",
                 "-n",
@@ -146,7 +153,7 @@ def main() -> int:
                 "python3",
                 str(extract_perf),
                 "--root",
-                f"masstree/{pressure}",
+                f"specjbb/{pressure}",
             ]
             print("Writing:", log_path)
             with open(log_path, "w") as log_f:

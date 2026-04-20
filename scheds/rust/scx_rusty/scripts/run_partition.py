@@ -31,13 +31,13 @@ QPS_limit_masstree = {
 }
 
 QPS_limit_specjbb = {
-   10 : 140000, # tested
+   10 : 15000, # tested
 }
 
 # Control policy parameters (adjust as needed)
 CONTROL_INTERVAL_SEC = 1.0
-LC_P99_HIGH_MS = 1.0
-LC_P99_LOW_MS = 0.8
+LC_P99_HIGH_MS = 1.5
+LC_P99_LOW_MS = 1.0
 LC_MIN_CORES = 1
 
 DEFAULT_LATENCY_MAP_PATH = "/sys/fs/bpf/latency_map_path"
