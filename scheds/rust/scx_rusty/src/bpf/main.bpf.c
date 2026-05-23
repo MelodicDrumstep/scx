@@ -1212,14 +1212,14 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 		if (!bpf_cpumask_test_cpu(i, cast_mask(p_cpumask)))
 			continue;
 
-		if (!bpf_cpumask_test_cpu(i, idle_cpumask))
+		sibling = get_smt_sibling(i);
+		if ((!bpf_cpumask_test_cpu(i, idle_cpumask)) || (!bpf_cpumask_test_cpu(sibling, idle_cpumask)))
 			continue;
 
 		if (cpu_has_be_running(i))
 			continue;
 
-		sibling = get_smt_sibling(i);
-		if (sibling >= 0 && cpu_has_be_running(sibling)) {
+		if (cpu_has_be_running(sibling)) {
 			/* This CPU is good but sibling has BE - save for later */
 			if (cpu_with_be_sibling < 0)
 				cpu_with_be_sibling = i;
@@ -1237,67 +1237,6 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 	if (best_cpu >= 0) {
 		scx_bpf_put_idle_cpumask(idle_cpumask);
 		return best_cpu;
-	}
-
-	/* Second pass: if we found a CPU with BE on sibling, kick BE from sibling */
-	if (cpu_with_be_sibling >= 0) {
-		sibling = get_smt_sibling(cpu_with_be_sibling);
-		if (sibling >= 0 && cpu_has_be_running(sibling)) {
-			// DEBUGING
-			// bpf_printk("[find_cpu_for_lc] Kick the BE task on the sibling CPU %d", sibling);
-
-			// update_cpu_running_task_type(sibling, TASK_TYPE_UNINITIALIZED);
-
-			/* Kick the BE task on the sibling CPU */
-			scx_bpf_kick_cpu(sibling, 0);
-			// /* Record the timestamp when BE is kicked */
-			// record_be_kick_timestamp();
-			/* Try to get the CPU */
-			if (scx_bpf_test_and_clear_cpu_idle(cpu_with_be_sibling)) {
-				scx_bpf_put_idle_cpumask(idle_cpumask);
-				return cpu_with_be_sibling;
-			}
-		}
-	}
-
-	/* Third pass: find any idle CPU with no BE, kick BE from both CPU and sibling if needed */
-	/* Only consider CPUs in the active core mask (set from --num-cores) */
-	for (i = 0; i < nr_cpu_ids; i++) {
-		// if (i >= 64 || !(active_cpumask & (1ULL << i)))
-		// 	continue;
-
-		if (!bpf_cpumask_test_cpu(i, cast_mask(p_cpumask)))
-			continue;
-
-		if (!bpf_cpumask_test_cpu(i, idle_cpumask))
-			continue;
-
-		if (cpu_has_be_running(i)) {
-			/* Kick BE from this CPU */
-			scx_bpf_kick_cpu(i, 0);
-			// /* Record the timestamp when BE is kicked */
-			// record_be_kick_timestamp();
-			continue;
-		}
-
-		sibling = get_smt_sibling(i);
-		if (sibling >= 0 && cpu_has_be_running(sibling)) {
-			// /* Kick BE from sibling */
-			// update_cpu_running_task_type(sibling, TASK_TYPE_UNINITIALIZED);
-
-			scx_bpf_kick_cpu(sibling, 0);
-			// /* Record the timestamp when BE is kicked */
-			// record_be_kick_timestamp();
-		}
-
-		// DEBUGING
-		// bpf_printk("[find_cpu_for_lc] Kick the BE task on the CPU %d", i);
-
-		/* Try to get the CPU after kicking */
-		if (scx_bpf_test_and_clear_cpu_idle(i)) {
-			scx_bpf_put_idle_cpumask(idle_cpumask);
-			return i;
-		}
 	}
 
 	scx_bpf_put_idle_cpumask(idle_cpumask);
@@ -1379,18 +1318,18 @@ s32 BPF_STRUCT_OPS(rusty_select_cpu, struct task_struct *p, s32 prev_cpu,
 	/* Update task type before checking (in case it was just added) */
 	assign_task_type(taskc, p);
 
-	/* LC task wakeup logic: find suitable CPU or kick BE to make room */
-	if (taskc->task_type == TASK_TYPE_LC) { /* LC = 2 */
-		cpu = find_cpu_for_lc(p, taskc, p_cpumask);
-		if (cpu >= 0) {
-			stat_add(RUSTY_STAT_DIRECT_DISPATCH, 1);
-			update_cpu_running_task_type(cpu, TASK_TYPE_LC);
-			// DEBUGING
-			// bpf_printk("[select_cpu] Update CPU %d task type to LC", cpu);
-			goto direct;
-		}
-		/* If no suitable CPU found, fall through to normal scheduling */
-	}
+	// /* LC task wakeup logic: find suitable CPU or kick BE to make room */
+	// if (taskc->task_type == TASK_TYPE_LC) { /* LC = 2 */
+	// 	cpu = find_cpu_for_lc(p, taskc, p_cpumask);
+	// 	if (cpu >= 0 && cpu != -ENOENT) {
+	// 		stat_add(RUSTY_STAT_DIRECT_DISPATCH, 1);
+	// 		update_cpu_running_task_type(cpu, TASK_TYPE_LC);
+	// 		// DEBUGING
+	// 		// bpf_printk("[select_cpu] Update CPU %d task type to LC", cpu);
+	// 		goto direct;
+	// 	}
+	// 	/* If no suitable CPU found, fall through to normal scheduling */
+	// }
 
 	// /* BE task: use previous CPU if it's available */
 	// if (taskc->task_type == TASK_TYPE_BE) {
