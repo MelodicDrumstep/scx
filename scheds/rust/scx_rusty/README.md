@@ -1,47 +1,136 @@
-# scx_rusty
+# SENSE: SMT-Enabled Next-generation Scheduling Engine
 
-This is a single user-defined scheduler used within [`sched_ext`](https://github.com/sched-ext/scx/tree/main), which is a Linux kernel feature which enables implementing kernel thread schedulers in BPF and dynamically loading them. [Read more about `sched_ext`](https://github.com/sched-ext/scx/tree/main).
+SENSE is a **multi-domain BPF/userspace hybrid scheduler** built on `scx_rusty` (part of the Linux `sched_ext` framework). It extends the upstream `scx_rusty` with:
 
-## Overview
+- **LC/BE task classification** — Latency-Critical (LC) and Best-Effort (BE) tasks are identified via a shared-memory ring buffer and scheduled differently.
+- **SMT-aware core placement** — LC tasks get dedicated physical cores by kicking BE tasks off SMT siblings. BE dispatch is blocked when an LC task occupies either SMT thread of a physical core.
+- **Latency-based BE throttling** — A userspace monitor reads LC p99 latency from a pinned BPF map. When latency exceeds the threshold, BE dispatch is globally paused.
+- **Dynamic core partitioning** — The `run_partition.py` script can dynamically move cores between LC and BE NUMA domains based on real-time latency feedback.
 
-A multi-domain, BPF / user space hybrid scheduler. The BPF portion of the
-scheduler does a simple round robin in each domain, and the user space portion
-(written in Rust) calculates the load factor of each domain, and informs BPF of
-how tasks should be load balanced accordingly.
+The scheduler monitors workload in [src/main.rs](src/main.rs) and implements scheduling decisions in [src/bpf/main.bpf.c](src/bpf/main.bpf.c).
 
-## How To Install
+---
 
-Available as a [Rust crate](https://crates.io/crates/scx_rusty): `cargo add scx_rusty`
+# Run
 
-## Typical Use Case
+## 1. Start the Scheduler
 
-`scx_rusty` is designed to be flexible, accommodating different architectures and
-workloads. Various load balancing thresholds (e.g. greediness, frequency, etc),
-as well as how `scx_rusty` should partition the system into scheduling domains, can
-be tuned to achieve the optimal configuration for any given system or workload.
+```bash
+sudo ../../../target/release/scx_rusty \
+    --task-type-shm /dev/shm/scx_rusty_task_types \
+    --timeout-ms 30000 \
+    --latency-threshold-ns <LATENCY_THRESHOLD_NS> \
+    --be-kick-cooldown-ms <BE_KICK_COOLDOWN_MS>
+```
 
-## Task Types via Shared Memory
+## 2. Run LC/BE Co-location Experiment
 
-`scx_rusty` can read task-type assignments from a shared memory file when it
-starts. Provide a path (for example one under `/dev/shm`) via
-`--task-type-shm <PATH>`. The file must contain whitespace-separated `PID TYPE`
-pairs per line, where `TYPE` is either `LC` (latency critical) or `BE`
-(best-effort). Lines beginning with `#` or blank lines are ignored. When a task
-that is tagged as `BE` becomes runnable, the in-kernel scheduler gives it a 0.5%
-chance of being enqueued rather than directly dispatched to a CPU, which lets
-latency-critical work run first.
+Run a single Latency-Critical (LC) workload alongside one Best-Effort (BE) benchmark:
 
-## Production Ready?
+```bash
+sudo python3 scripts/run_test_tailbench.py \
+    --LC masstree \
+    --BE <BE_type> \
+    --NUMA_unaware \
+    -n <num_cores> \
+    --task-type-shm /dev/shm/scx_rusty_task_types \
+    -p <high|medium|low> \
+    --latency-low-ms <LATENCY_LOW_MS> \
+    --latency-high-ms <LATENCY_HIGH_MS> \
+    --be-dispatch-interval-ms <BE_DISPATCH_INTERVAL_MS>
+    --disable-skip
+```
 
-Yes. If tuned correctly, `scx_rusty` should be performant across various CPU
-architectures and workloads. By default, `scx_rusty` creates a separate scheduling
-domain per-LLC, so its default configuration may be performant as well. Note
-however that `scx_rusty` does not yet disambiguate between LLCs in different NUMA
-nodes, so it may perform better on multi-CCX machines where all the LLCs share
-the same socket, as opposed to multi-socket machines.
+Run the full SPEC CPU2006 suite as BE:
 
-Note as well that you may run into an issue with infeasible weights, where a
-task with a very high weight may cause the scheduler to incorrectly leave cores
-idle because it thinks they're necessary to accommodate the compute for a
-single task. This can also happen in CFS, and should soon be addressed for
-`scx_rusty`.
+```bash
+sudo python3 scripts/run_test_tailbench.py \
+    --LC masstree \
+    --run_all_SPEC \
+    --NUMA_unaware \
+    -n <num_cores> \
+    --task-type-shm /dev/shm/scx_rusty_task_types \
+    -p <high|medium|low> \
+    --latency-low-ms <LATENCY_LOW_MS> \
+    --latency-high-ms <LATENCY_HIGH_MS> \
+    --be-dispatch-interval-ms <BE_DISPATCH_INTERVAL_MS>
+    --disable-skip
+```
+
+## 3. Dynamic Core Partitioning
+
+Partition mode dynamically moves cores between LC and BE based on real-time p99 latency:
+
+```bash
+sudo python3 scripts/run_partition.py \
+    --LC masstree \
+    --BE <BE_type> \
+    --NUMA_unaware \
+    -n <num_cores> \
+    -p <high|medium|low> \
+    --lc_p99_low_ms <LC_P99_LOW_MS> \
+    --lc_p99_high_ms <LC_P99_HIGH_MS>
+```
+
+Partition across all SPEC benchmarks:
+
+```bash
+sudo python3 scripts/run_partition.py \
+    --LC masstree \
+    --run_all_SPEC \
+    --NUMA_unaware \
+    -n <num_cores> \
+    -p <high|medium|low> \
+    -lc_p99_low_ms <LC_P99_LOW_MS> \
+    -lc_p99_high_ms <LC_P99_HIGH_MS>
+```
+
+## Example: How to run 10 core, high load senarios
+
+### SENSE Scheduler:
+
+In one terminal:
+
+```bash
+sudo ../../../target/release/scx_rusty --task-type-shm /dev/shm/scx_rusty_task_types --timeout-ms 30000  --latency-high-ms 2.6 --latency-low-ms 2.2 --num-cores 10 --be-dispatch-interval-ms 180
+```
+
+Another terminal:
+
+```bash
+sudo python3 run_test_tailbench.py --LC masstree --BE 401.bzip2 --NUMA_unaware -n 10 --task-type-shm /dev/shm/scx_rusty_task_types -p high --disable-skip
+```
+
+### Isolation
+
+```bash
+sudo python3 run_partition.py --LC masstree --BE 401.bzip2 --NUMA_unaware -n 10 -p high
+```
+
+---
+
+# Data Analysis
+
+Extract per-BE p99 latency and throughput results:
+
+```bash
+python3 scripts/extract_masstree_perf.py --root masstree/high
+```
+
+---
+
+# Details:
+
+1. Requires modified support for Tailbench to write p99 latency into a ring buffer in shared memory.
+
+2. Since BE processes continuously spawn child threads, the scheduler uses the parent process information from the process control block to identify BE tasks.
+
+3. The performance of the SENSE scheduler is sensitive to the `latency_low_ms`, `latency_high_ms`, and `be_dispatch_interval_ms` parameters. These parameters need to be adjusted for different invocation scenarios.
+
+4. To prevent a sudden surge in BE task scheduling—which would cause a sharp increase in LC latency—at the moment when LC performance targets transition from unsatisfied to satisfied, the SENSE scheduler introduces a rate limiting mechanism for scheduling BE tasks.
+
+5. Run `sudo pkill -f runspec` if `Ctrl-C` fails to clean up a running test script.
+
+# License
+
+Based on `scx_rusty` — [GPL-2.0-only](LICENSE).
