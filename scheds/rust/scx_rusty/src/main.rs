@@ -97,6 +97,23 @@ const MAX_CPUS: usize = bpf_intf::consts_MAX_CPUS as usize;
 /// WARNING: scx_rusty currently assumes that all domains have equal
 /// processing power and at similar distances from each other. This
 /// limitation will be removed in the future.
+
+/// Predefined CPU core masks for use with --num-cores.
+/// Maps the number of active physical cores to a hex bitmask selecting
+/// which logical CPUs participate in scheduling.
+/// On a 40-core SMT-2 system (CPU 0-19: thread 0, CPU 20-39: thread 1):
+///   - 10 cores: selects CPUs 0-9 and 20-29 (10 physical cores, both SMT threads)
+///   - 15 cores: selects CPUs 0-14 and 20-34 (15 physical cores, both SMT threads)
+///   - 20 cores: selects all 40 logical CPUs (20 physical cores, both SMT threads)
+fn core_mask_hex(num_cores: u32) -> Option<&'static str> {
+    match num_cores {
+        10 => Some("0x3FF003FF"),
+        15 => Some("0x7FFF07FFF"),
+        20 => Some("0xFFFFFFFFFF"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Parser)]
 struct Opts {
     /// Scheduling slice duration for under-utilized hosts, in microseconds.
@@ -250,9 +267,28 @@ struct Opts {
     #[clap(long, default_value = "1200")]
     be_kick_cooldown_ms: u64,
 
-    /// Latency map sample (nanoseconds) above this marks high latency in BPF.
-    #[clap(long, default_value = "1800000")]
-    latency_threshold_ns: u32,
+    /// Interval between BE dispatch (milliseconds).
+    #[clap(long, default_value = "100")]
+    be_dispatch_interval_ms: u64,
+
+    /// LC p99 latency (milliseconds) above this value triggers the high-latency
+    /// flag in BPF. Once set, the flag stays set until latency drops below
+    /// --latency-low-ms, preventing oscillation.
+    #[clap(long, default_value = "2.5")]
+    latency_high_ms: f64,
+
+    /// LC p99 latency (milliseconds) below this value clears the high-latency
+    /// flag. Must be <= --latency-high-ms. Forms a hysteresis band to prevent
+    /// rapid toggling when latency fluctuates around the threshold.
+    #[clap(long, default_value = "2.0")]
+    latency_low_ms: f64,
+
+    /// Number of active cores for scheduling. Uses a predefined mask table
+    /// to select which CPUs participate. Supported values: 10, 15, 20.
+    /// Defaults to 10 (all cores). The mask selects both SMT threads for
+    /// each physical core in a NUMA-balanced layout.
+    #[clap(long, default_value = "10")]
+    num_cores: u32,
 
     #[clap(flatten, next_help_heading = "Libbpf Options")]
     pub libbpf: LibbpfOpts,
@@ -378,10 +414,12 @@ struct Scheduler<'a> {
     tuner: Tuner,
     stats_server: StatsServer<StatsCtx, (StatsCtx, ClusterStats)>,
 
-    latency_map_fd: Option<i32>,  // File descriptor for external latency map
+    latency_map_fd: Option<i32>, // File descriptor for external latency map
     latency_check_interval: Duration,
     next_latency_check: Instant,
-    latency_threshold_ns: u32,
+    latency_high_ns: f64,
+    latency_low_ns: f64,
+    high_latency: bool, // cached state to avoid reading BPF map
 }
 
 impl<'a> Scheduler<'a> {
@@ -412,7 +450,8 @@ impl<'a> Scheduler<'a> {
                     .unwrap_or("scx_rusty_task_types");
                 std::path::PathBuf::from(format!("/sys/fs/bpf/{}", filename))
             };
-            skel.maps.task_type_ring_buffer
+            skel.maps
+                .task_type_ring_buffer
                 .set_pin_path(&pin_path)
                 .context("Failed to set pin path for task type ring buffer")?;
         }
@@ -498,18 +537,34 @@ impl<'a> Scheduler<'a> {
         rodata.mempolicy_affinity = opts.mempolicy_affinity;
         rodata.debug = opts.verbose as u32;
         rodata.rusty_perf_mode = opts.perf;
-        rodata.be_kick_cooldown_ns = opts
-            .be_kick_cooldown_ms
-            .saturating_mul(1_000_000);
+        rodata.be_kick_cooldown_ns = opts.be_kick_cooldown_ms.saturating_mul(1_000_000);
+        rodata.be_dispatch_interval_ns = opts.be_dispatch_interval_ms.saturating_mul(1_000_000);
+
+        // Set active CPU mask from --num-cores lookup table
+        let mask_hex = core_mask_hex(opts.num_cores).ok_or_else(|| {
+            anyhow!(
+                "Unsupported --num-cores value: {}. Supported: 10, 15, 20",
+                opts.num_cores
+            )
+        })?;
+        let mask_val = u64::from_str_radix(mask_hex.trim_start_matches("0x"), 16)
+            .context("Failed to parse core mask hex value")?;
+        rodata.active_cpumask = mask_val;
+        info!(
+            "Active CPU mask (num_cores={}): 0x{:016X}",
+            opts.num_cores, mask_val
+        );
+
+        // print!("mask_val: {:016X}", mask_val);
 
         // Attach.
         let mut skel = scx_ops_load!(skel, rusty, uei)?;
-        
+
         // Initialize task type ring buffer for dynamic updates
         // The map is automatically pinned during load if pin path was set above
         task_type::init_task_type_ring_buffer(&mut skel)
             .context("Failed to initialize task type ring buffer")?;
-        
+
         if let Some(ref shm_path) = opts.task_type_shm {
             let shm_path_str = shm_path.to_string_lossy();
             let pin_path = if shm_path_str.starts_with("/sys/fs/bpf/") {
@@ -525,7 +580,7 @@ impl<'a> Scheduler<'a> {
         } else {
             info!("Task type ring buffer initialized. Applications can push updates dynamically.");
         }
-        
+
         let struct_ops = Some(scx_ops_attach!(skel, rusty)?);
         let stats_server = StatsServer::new(stats::server_data()).launch()?;
 
@@ -547,8 +602,11 @@ impl<'a> Scheduler<'a> {
                 .context("Failed to create CString for latency map path")?;
             let fd = libbpf_sys::bpf_obj_get(path_cstr.as_ptr() as *const libc::c_char);
             if fd < 0 {
-                info!("Warning: Failed to open latency map at {}: {}. Latency monitoring disabled.", 
-                      latency_map_path, std::io::Error::last_os_error());
+                info!(
+                    "Warning: Failed to open latency map at {}: {}. Latency monitoring disabled.",
+                    latency_map_path,
+                    std::io::Error::last_os_error()
+                );
                 None
             } else {
                 info!("Successfully opened latency map at {}", latency_map_path);
@@ -582,9 +640,11 @@ impl<'a> Scheduler<'a> {
             stats_server,
 
             latency_map_fd,
-            latency_check_interval: Duration::from_millis(1000), // Check every 1000ms
+            latency_check_interval: Duration::from_millis(100), // Check every 100ms
             next_latency_check: Instant::now(),
-            latency_threshold_ns: opts.latency_threshold_ns,
+            latency_high_ns: opts.latency_high_ms * 1_000_000.0,
+            latency_low_ns: opts.latency_low_ms * 1_000_000.0,
+            high_latency: false,
         })
     }
 
@@ -674,11 +734,12 @@ impl<'a> Scheduler<'a> {
 
     fn check_latency(&mut self) -> Result<()> {
         const MAP_KEY: u32 = 0;
-        let threshold_ns = self.latency_threshold_ns;
-        
+        let high_ns = self.latency_high_ns;
+        let low_ns = self.latency_low_ns;
+
         // Track initialization state
         static mut FIRST_CALL: bool = true;
-    
+
         if let Some(latency_fd) = self.latency_map_fd {
             // On first call, explicitly set latency to 0 in the BPF map
             unsafe {
@@ -686,14 +747,14 @@ impl<'a> Scheduler<'a> {
                     let key = MAP_KEY.to_ne_bytes();
                     let zero_value: u32 = 0;
                     let value_ptr = &zero_value as *const u32 as *const libc::c_void;
-                    
+
                     let ret = libbpf_sys::bpf_map_update_elem(
                         latency_fd,
                         key.as_ptr() as *const libc::c_void,
                         value_ptr,
                         0, // BPF_ANY flag
                     );
-                    
+
                     if ret == 0 {
                         info!("Initialized latency map to 0");
                     } else {
@@ -702,12 +763,12 @@ impl<'a> Scheduler<'a> {
                     FIRST_CALL = false;
                 }
             }
-            
+
             // Read latency value from external map
             let mut latency_value: u32 = 0;
             let key = MAP_KEY.to_ne_bytes();
             let value_ptr = &mut latency_value as *mut u32 as *mut libc::c_void;
-    
+
             let ret = unsafe {
                 libbpf_sys::bpf_map_lookup_elem(
                     latency_fd,
@@ -715,33 +776,50 @@ impl<'a> Scheduler<'a> {
                     value_ptr,
                 )
             };
-    
+
             if ret == 0 {
-                // Print the latency value here
-                // info!("Latency value: {} ns", latency_value);
-                // Check if this is the first successful read after initialization
-                
-                let high_latency = latency_value > threshold_ns;
-    
-                // Update high latency flag in BPF map
-                let flag_map = &self.skel.maps.high_latency_flag;
-                let flag_key = MAP_KEY.to_ne_bytes();
-                let flag_value: u8 = if high_latency { 1 } else { 0 };
-    
-                flag_map
-                    .update(&flag_key, &flag_value.to_ne_bytes(), MapFlags::ANY)
-                    .context("Failed to update high latency flag")?;
-    
-                if high_latency {
-                    info!("High latency detected: {} ns (threshold: {} ns)", 
-                          latency_value, threshold_ns);
+                let latency_ns = latency_value as f64;
+
+                // Hysteresis: set flag when above high threshold, clear when below low threshold.
+                // Between the two thresholds, keep current state to prevent oscillation.
+                let old_flag = self.high_latency;
+                let new_flag = if latency_ns > high_ns {
+                    true
+                } else if latency_ns < low_ns {
+                    false
+                } else {
+                    old_flag // hysteresis zone — keep current state
+                };
+
+                if new_flag != old_flag {
+                    self.high_latency = new_flag;
+
+                    let flag_map = &self.skel.maps.high_latency_flag;
+                    let flag_key = MAP_KEY.to_ne_bytes();
+                    let flag_value: u8 = if new_flag { 1 } else { 0 };
+
+                    flag_map
+                        .update(&flag_key, &flag_value.to_ne_bytes(), MapFlags::ANY)
+                        .context("Failed to update high latency flag")?;
+
+                    if new_flag {
+                        info!(
+                            "High latency: {} ns > high threshold {} ns, flag SET",
+                            latency_ns, high_ns
+                        );
+                    } else {
+                        info!(
+                            "Latency recovered: {} ns < low threshold {} ns, flag CLEARED",
+                            latency_ns, low_ns
+                        );
+                    }
                 }
             } else {
                 // Failed to read latency map (might not exist yet or was closed)
                 // Silently continue - this is not critical
             }
         }
-    
+
         Ok(())
     }
 
@@ -830,6 +908,14 @@ impl Drop for Scheduler<'_> {
 
 fn main() -> Result<()> {
     let opts = Opts::parse();
+
+    if opts.latency_low_ms > opts.latency_high_ms {
+        bail!(
+            "--latency-low-ms ({}) must be <= --latency-high-ms ({})",
+            opts.latency_low_ms,
+            opts.latency_high_ms
+        );
+    }
 
     if opts.version {
         println!(

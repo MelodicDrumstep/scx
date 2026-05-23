@@ -37,11 +37,7 @@ impl TaskType {
 /// Write a task type update to the ring buffer.
 /// This allows applications to dynamically update task types.
 /// Returns Ok(true) if the update was successfully queued, Ok(false) if the ring buffer is full.
-pub fn write_task_type_update(
-    skel: &mut BpfSkel,
-    pid: u32,
-    task_type: TaskType,
-) -> Result<bool> {
+pub fn write_task_type_update(skel: &mut BpfSkel, pid: u32, task_type: TaskType) -> Result<bool> {
     const RING_KEY: u32 = 0;
     const TASK_TYPE_RING_SIZE: usize = bpf_intf::consts_TASK_TYPE_RING_SIZE as usize;
 
@@ -62,18 +58,9 @@ pub fn write_task_type_update(
     }
 
     // Read current producer and consumer indices
-    let producer = u32::from_ne_bytes([
-        ring_bytes[4],
-        ring_bytes[5],
-        ring_bytes[6],
-        ring_bytes[7],
-    ]);
-    let consumer = u32::from_ne_bytes([
-        ring_bytes[8],
-        ring_bytes[9],
-        ring_bytes[10],
-        ring_bytes[11],
-    ]);
+    let producer = u32::from_ne_bytes([ring_bytes[4], ring_bytes[5], ring_bytes[6], ring_bytes[7]]);
+    let consumer =
+        u32::from_ne_bytes([ring_bytes[8], ring_bytes[9], ring_bytes[10], ring_bytes[11]]);
 
     // Check if ring buffer is full
     if producer - consumer >= TASK_TYPE_RING_SIZE as u32 {
@@ -139,4 +126,3 @@ pub fn init_task_type_ring_buffer(skel: &mut BpfSkel) -> Result<()> {
 
     Ok(())
 }
-

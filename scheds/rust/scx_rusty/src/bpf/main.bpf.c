@@ -71,7 +71,7 @@ UEI_DEFINE(uei);
  */
 const volatile u32 nr_doms = 32;	/* !0 for veristat, set during init */
 const volatile u32 nr_nodes = 32;	/* !0 for veristat, set during init */
-const volatile u32 nr_cpu_ids = 64;	/* !0 for veristat, set during init */
+const volatile u32 nr_cpu_ids = 40;	/* !0 for veristat, set during init */
 const volatile u32 cpu_dom_id_map[MAX_CPUS];
 const volatile u32 dom_numa_id_map[MAX_DOMS];
 const volatile u64 dom_cpumasks[MAX_DOMS][MAX_CPUS / 64];
@@ -89,6 +89,15 @@ const volatile u32 debug;
 
 /* Cooldown after BE kick (nanoseconds). Default 1200ms. Set from userspace. */
 const volatile u64 be_kick_cooldown_ns = 1200000000ULL;
+const volatile u64 be_dispatch_interval_ns = 100000000ULL;
+
+/* Active CPU mask loaded from CORE_MASK_HEX table (based on --num-cores).
+ * Only CPUs whose bits are set in this mask participate in LC scheduling.
+ * Covers CPUs 0-63 (sufficient for 40-core SMT systems).
+ */
+const volatile u64 active_cpumask;
+
+u64 last_be_dispatch_time = 0;
 
 /* base slice duration */
 volatile u64 slice_ns;
@@ -756,18 +765,18 @@ static s32 get_smt_sibling(s32 cpu)
 	return cpu - 20;
 }
 
-/* Record the timestamp when a BE task is kicked by LC */
-static void record_be_kick_timestamp(void)
-{
-	const u32 zero = 0;
-	u64 now = scx_bpf_now();
-	u64 *timestamp;
+// /* Record the timestamp when a BE task is kicked by LC */
+// static void record_be_kick_timestamp(void)
+// {
+// 	const u32 zero = 0;
+// 	u64 now = scx_bpf_now();
+// 	u64 *timestamp;
 
-	timestamp = bpf_map_lookup_elem(&last_be_kick_timestamp, &zero);
-	if (timestamp) {
-		*timestamp = now;
-	}
-}
+// 	timestamp = bpf_map_lookup_elem(&last_be_kick_timestamp, &zero);
+// 	if (timestamp) {
+// 		*timestamp = now;
+// 	}
+// }
 
 /* Check if BE dispatch is allowed (not within cooldown period after BE kick) */
 static bool is_be_dispatch_allowed(void)
@@ -1192,11 +1201,13 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 		return -ENOENT;
 
 	/* First pass: find CPUs that are idle, have no BE, and SMT sibling has no BE */
-	/* Only consider CPUs that are multiples of 4 (0, 4, 8, 12, ..., 36) */
+	/* Only consider CPUs in the active core mask (set from --num-cores) */
+	bpf_printk("nr_cpu_ids: %d", nr_cpu_ids);
 	for (i = 0; i < nr_cpu_ids; i++) {
-		// /* Skip CPUs that are not multiples of 4 (cast to u32 to avoid signed division) */
-		// if (((u32)i % 4) != 0)
-		// 	continue;
+		if (!(active_cpumask & (1ULL << i))) {
+			// bpf_printk("[find_cpu_for_lc] CPU %d is not in the active core mask", i);
+			continue;
+		}
 
 		if (!bpf_cpumask_test_cpu(i, cast_mask(p_cpumask)))
 			continue;
@@ -1239,8 +1250,8 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 
 			/* Kick the BE task on the sibling CPU */
 			scx_bpf_kick_cpu(sibling, 0);
-			/* Record the timestamp when BE is kicked */
-			record_be_kick_timestamp();
+			// /* Record the timestamp when BE is kicked */
+			// record_be_kick_timestamp();
 			/* Try to get the CPU */
 			if (scx_bpf_test_and_clear_cpu_idle(cpu_with_be_sibling)) {
 				scx_bpf_put_idle_cpumask(idle_cpumask);
@@ -1250,10 +1261,9 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 	}
 
 	/* Third pass: find any idle CPU with no BE, kick BE from both CPU and sibling if needed */
-	/* Only consider CPUs that are multiples of 4 (0, 4, 8, 12, ..., 36) */
+	/* Only consider CPUs in the active core mask (set from --num-cores) */
 	for (i = 0; i < nr_cpu_ids; i++) {
-		// /* Skip CPUs that are not multiples of 4 (cast to u32 to avoid signed division) */
-		// if (((u32)i % 4) != 0)
+		// if (i >= 64 || !(active_cpumask & (1ULL << i)))
 		// 	continue;
 
 		if (!bpf_cpumask_test_cpu(i, cast_mask(p_cpumask)))
@@ -1265,8 +1275,8 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 		if (cpu_has_be_running(i)) {
 			/* Kick BE from this CPU */
 			scx_bpf_kick_cpu(i, 0);
-			/* Record the timestamp when BE is kicked */
-			record_be_kick_timestamp();
+			// /* Record the timestamp when BE is kicked */
+			// record_be_kick_timestamp();
 			continue;
 		}
 
@@ -1276,8 +1286,8 @@ static s32 find_cpu_for_lc(struct task_struct *p, struct task_ctx *taskc,
 			// update_cpu_running_task_type(sibling, TASK_TYPE_UNINITIALIZED);
 
 			scx_bpf_kick_cpu(sibling, 0);
-			/* Record the timestamp when BE is kicked */
-			record_be_kick_timestamp();
+			// /* Record the timestamp when BE is kicked */
+			// record_be_kick_timestamp();
 		}
 
 		// DEBUGING
@@ -1874,44 +1884,57 @@ void BPF_STRUCT_OPS(rusty_dispatch, s32 cpu, struct task_struct *prev)
 	/* Cast to u32 to avoid signed division error */
 
 	/* Check if BE dispatch is allowed (not within cooldown period after BE kick) */
-	if (!is_be_dispatch_allowed()) {
-		// bpf_printk("[dispatch] BE dispatch blocked due to cooldown period on CPU %d", cpu);
-		goto skip_be_dispatch;
-	}
+	if (active_cpumask & (1ULL << cpu_u)) {
+		// if (!is_be_dispatch_allowed()) {
+		// 	// bpf_printk("[dispatch] BE dispatch blocked due to cooldown period on CPU %d", cpu);
+		// 	goto skip_be_dispatch;
+		// }
 
-	/* Check if high latency is detected - can be used to adjust scheduling behavior */
-	if (is_high_latency()) {
-		/* High latency detected - could adjust BE dispatch behavior here */
-		/* For example: reduce BE dispatch probability or delay BE tasks further */
-		// bpf_printk("[dispatch] High latency detected - could adjust BE dispatch behavior here");
-		goto skip_be_dispatch;
-	}
+		/* Check if high latency is detected - can be used to adjust scheduling behavior */
+		if (is_high_latency()) {
+			/* High latency detected - could adjust BE dispatch behavior here */
+			/* For example: reduce BE dispatch probability or delay BE tasks further */
+			// bpf_printk("[dispatch] High latency detected - could adjust BE dispatch behavior here");
+			goto skip_be_dispatch;
+		}
 
-	cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
-	if (cpu_task_type && *cpu_task_type == TASK_TYPE_UNINITIALIZED) {
-		/* Current CPU has no LC task running */
-		sibling = get_smt_sibling(cpu);
-		if (sibling >= 0) {
-			/* Has SMT sibling: check if sibling also has no LC task running */
-			cpu_sibling_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, sibling);
-			if (cpu_sibling_task_type && *cpu_sibling_task_type == TASK_TYPE_UNINITIALIZED) {
-				/* Both current CPU and SMT sibling have no LC task running */
-				can_dispatch_be = true;
-				// bpf_printk("[dispatch] We can dispatch BE task on CPU %d since CPU task type is %d and sibling task type is %d", cpu, *cpu_task_type, *cpu_sibling_task_type);
+		// // DEBUGING
+		// const struct cpumask *idle_cpumask = scx_bpf_get_idle_cpumask();
+		// // DEBUGING
+
+		cpu_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, cpu);
+		if (cpu_task_type && *cpu_task_type == TASK_TYPE_UNINITIALIZED) {
+			// if (!bpf_cpumask_test_cpu(cpu, idle_cpumask)) {
+			// 	bpf_printk("[dispatch] CPU %d is not idle, but running task type is uninitialized", cpu);
+			// }
+			/* Current CPU has no LC task running */
+			sibling = get_smt_sibling(cpu);
+			if (sibling >= 0) {
+				/* Has SMT sibling: check if sibling also has no LC task running */
+				cpu_sibling_task_type = bpf_map_lookup_percpu_elem(&cpu_running_task_type, &zero, sibling);
+				if (cpu_sibling_task_type && *cpu_sibling_task_type == TASK_TYPE_UNINITIALIZED) {
+					/* Both current CPU and SMT sibling have no LC task running */
+					can_dispatch_be = true;
+					// bpf_printk("[dispatch] We can dispatch BE task on CPU %d since CPU task type is %d and sibling task type is %d", cpu, *cpu_task_type, *cpu_sibling_task_type);
+				}
 			}
 		}
-	}
-	
-	if (can_dispatch_be) {
-		if (scx_bpf_dsq_move_to_local(PENDING_DSQ_ID)) {
-			stat_add(RUSTY_STAT_BE_DELAYED, 1);
-			// if (debug >= 2) {
-				// bpf_printk("[dispatch] Dispatched BE task from pending DSQ on CPU %d", cpu);
-			// }
-			update_cpu_running_task_type(cpu, TASK_TYPE_BE);
-			// DEBUGING
-			// bpf_printk("[dispatch] Update CPU %d task type to BE", cpu);
-			return;
+		
+		// Implement the BE scheduling flow control logic here:
+		// we should wait at least <BE_dispatch_interval> before dispatching another BE
+
+		if (can_dispatch_be && time_after(scx_bpf_now(), last_be_dispatch_time + be_dispatch_interval_ns)) {
+			last_be_dispatch_time = scx_bpf_now();
+			if (scx_bpf_dsq_move_to_local(PENDING_DSQ_ID)) {
+				stat_add(RUSTY_STAT_BE_DELAYED, 1);
+				// if (debug >= 2) {
+					// bpf_printk("[dispatch] Dispatched BE task from pending DSQ on CPU %d", cpu);
+				// }
+				update_cpu_running_task_type(cpu, TASK_TYPE_BE);
+				// DEBUGING
+				// bpf_printk("[dispatch] Update CPU %d task type to BE", cpu);
+				return;
+			}
 		}
 	}
 skip_be_dispatch:

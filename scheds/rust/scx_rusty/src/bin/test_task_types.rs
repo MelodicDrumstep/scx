@@ -12,8 +12,8 @@ use std::os::unix::io::RawFd;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 const TASK_TYPE_RING_SIZE: usize = 1024;
 const TASK_TYPE_LC: u8 = 0;
@@ -67,10 +67,7 @@ fn find_bpf_map_fd(map_name: &str) -> Result<RawFd> {
 
     // Last resort: try to find by map ID using bpftool
     // This requires bpftool to be installed
-    if let Ok(output) = Command::new("bpftool")
-        .args(["map", "list"])
-        .output()
-    {
+    if let Ok(output) = Command::new("bpftool").args(["map", "list"]).output() {
         let output_str = String::from_utf8_lossy(&output.stdout);
         for line in output_str.lines() {
             if line.contains(map_name) {
@@ -96,13 +93,16 @@ fn find_bpf_map_fd(map_name: &str) -> Result<RawFd> {
 
 /// Open a BPF map by path and return its file descriptor
 fn open_map_fd_by_path(path: &str) -> Result<RawFd> {
-    let path_cstr = CString::new(path)
-        .context("Invalid path")?;
-    
+    let path_cstr = CString::new(path).context("Invalid path")?;
+
     // Use bpf_obj_get to get the map FD from the pinned path
     let fd = unsafe { libbpf_sys::bpf_obj_get(path_cstr.as_ptr() as *const libc::c_char) };
     if fd < 0 {
-        return Err(anyhow!("Failed to open BPF map at {}: {}", path, std::io::Error::last_os_error()));
+        return Err(anyhow!(
+            "Failed to open BPF map at {}: {}",
+            path,
+            std::io::Error::last_os_error()
+        ));
     }
 
     Ok(fd)
@@ -133,11 +133,7 @@ struct Opts {
 const CORES: [usize; 10] = [0, 4, 8, 12, 16, 20, 24, 28, 32, 36];
 
 /// Write a task type update to the ring buffer
-fn write_task_type_update(
-    map_fd: RawFd,
-    pid: u32,
-    task_type: u8,
-) -> Result<bool> {
+fn write_task_type_update(map_fd: RawFd, pid: u32, task_type: u8) -> Result<bool> {
     const RING_KEY: u32 = 0;
 
     let key = RING_KEY.to_ne_bytes();
@@ -151,7 +147,7 @@ fn write_task_type_update(
             value.as_mut_ptr() as *mut libc::c_void,
         )
     };
-    
+
     if ret != 0 {
         return Err(anyhow!(
             "Failed to lookup task type ring buffer: {}",
@@ -166,18 +162,8 @@ fn write_task_type_update(
     }
 
     // Read current producer and consumer indices
-    let producer = u32::from_ne_bytes([
-        value[4],
-        value[5],
-        value[6],
-        value[7],
-    ]);
-    let consumer = u32::from_ne_bytes([
-        value[8],
-        value[9],
-        value[10],
-        value[11],
-    ]);
+    let producer = u32::from_ne_bytes([value[4], value[5], value[6], value[7]]);
+    let consumer = u32::from_ne_bytes([value[8], value[9], value[10], value[11]]);
 
     // Check if ring buffer is full
     if producer.wrapping_sub(consumer) >= TASK_TYPE_RING_SIZE as u32 {
@@ -241,22 +227,21 @@ fn get_current_pid() -> u32 {
 // And also consider child threads
 fn get_child_pids(parent_pid: u32) -> Result<Vec<u32>> {
     let mut child_pids = Vec::new();
-    
+
     // Use pgrep -P to get direct children
     let output = Command::new("pgrep")
         .arg("-P")
         .arg(parent_pid.to_string())
         .output()
         .context("Failed to run pgrep")?;
-    
+
     if !output.status.success() {
         // pgrep returns non-zero if no processes found, which is fine
         return Ok(child_pids);
     }
-    
-    let output_str = String::from_utf8(output.stdout)
-        .context("Failed to parse pgrep output")?;
-    
+
+    let output_str = String::from_utf8(output.stdout).context("Failed to parse pgrep output")?;
+
     for pid_str in output_str.lines() {
         if pid_str.is_empty() {
             continue;
@@ -273,9 +258,8 @@ fn get_child_pids(parent_pid: u32) -> Result<Vec<u32>> {
         .arg(parent_pid.to_string())
         .output()
         .context("Failed to run ps")?;
-    let threads_str = String::from_utf8(threads.stdout)
-        .context("Failed to parse ps output")?;
-    
+    let threads_str = String::from_utf8(threads.stdout).context("Failed to parse ps output")?;
+
     for line in threads_str.lines() {
         if line.is_empty() {
             continue;
@@ -303,41 +287,65 @@ fn recursively_write_children_to_ring_buffer(
     if current_depth >= max_depth {
         return Ok(0);
     }
-    
+
     let child_pids = get_child_pids(parent_pid)?;
     let mut written_count = 0;
-    
+
     for child_pid in child_pids {
         // DEBUGING
-        println!("  DEBUG: Writing child PID {} -> {} (depth {})", 
-                 child_pid,
-                 if task_type == TASK_TYPE_LC { "LC" } else { "BE" },
-                 current_depth + 1);
+        println!(
+            "  DEBUG: Writing child PID {} -> {} (depth {})",
+            child_pid,
+            if task_type == TASK_TYPE_LC {
+                "LC"
+            } else {
+                "BE"
+            },
+            current_depth + 1
+        );
 
         // Write this child PID to the ring buffer
         match write_task_type_update(map_fd, child_pid, task_type) {
             Ok(true) => {
                 written_count += 1;
                 if current_depth == 0 {
-                    println!("  Written: Child PID {} -> {} (depth {})", 
-                             child_pid,
-                             if task_type == TASK_TYPE_LC { "LC" } else { "BE" },
-                             current_depth + 1);
+                    println!(
+                        "  Written: Child PID {} -> {} (depth {})",
+                        child_pid,
+                        if task_type == TASK_TYPE_LC {
+                            "LC"
+                        } else {
+                            "BE"
+                        },
+                        current_depth + 1
+                    );
                 }
             }
             Ok(false) => {
-                eprintln!("  Warning: Ring buffer full, could not write child PID {} -> {}", 
-                          child_pid, 
-                          if task_type == TASK_TYPE_LC { "LC" } else { "BE" });
+                eprintln!(
+                    "  Warning: Ring buffer full, could not write child PID {} -> {}",
+                    child_pid,
+                    if task_type == TASK_TYPE_LC {
+                        "LC"
+                    } else {
+                        "BE"
+                    }
+                );
             }
             Err(e) => {
-                eprintln!("  Error writing child PID {} -> {}: {}", 
-                          child_pid,
-                          if task_type == TASK_TYPE_LC { "LC" } else { "BE" },
-                          e);
+                eprintln!(
+                    "  Error writing child PID {} -> {}: {}",
+                    child_pid,
+                    if task_type == TASK_TYPE_LC {
+                        "LC"
+                    } else {
+                        "BE"
+                    },
+                    e
+                );
             }
         }
-        
+
         // Recursively write grandchildren
         let grandchildren_written = recursively_write_children_to_ring_buffer(
             map_fd,
@@ -348,7 +356,7 @@ fn recursively_write_children_to_ring_buffer(
         )?;
         written_count += grandchildren_written;
     }
-    
+
     Ok(written_count)
 }
 
@@ -393,9 +401,10 @@ fn main() -> Result<()> {
     // We need to create separate processes for LC and BE parent threads
     // because they need different tgids. Let's use a different approach:
     // Launch two separate processes, each with their own main thread that acts as parent
-    
+
     // Launch LC parent process
-    let lc_script = format!(r#"
+    let lc_script = format!(
+        r#"
         #!/bin/bash
         # LC parent process - spawns {} LC threads every 0s
         CORES=(0 4 8 12 16 20 24 28 32 36)
@@ -428,8 +437,14 @@ fn main() -> Result<()> {
             echo "LC parent spawned {} threads (batch $COUNTER)"
             sleep 5
         done
-    "#, opts.num_lc_threads, opts.num_lc_threads, opts.num_lc_threads, opts.num_lc_threads, opts.num_lc_threads);
-    
+    "#,
+        opts.num_lc_threads,
+        opts.num_lc_threads,
+        opts.num_lc_threads,
+        opts.num_lc_threads,
+        opts.num_lc_threads
+    );
+
     let mut lc_child = Command::new("bash")
         .arg("-c")
         .arg(&lc_script)
@@ -439,7 +454,8 @@ fn main() -> Result<()> {
     thread::sleep(Duration::from_millis(100));
 
     // Launch BE parent process
-    let be_script = format!(r#"
+    let be_script = format!(
+        r#"
         #!/bin/bash
         # BE parent process - spawns {} BE threads every 10s
         COUNTER=0
@@ -472,8 +488,14 @@ fn main() -> Result<()> {
             echo "BE parent spawned {} threads (batch $COUNTER)"
             sleep 5
         done
-    "#, opts.num_be_threads, opts.num_be_threads, opts.num_be_threads, opts.num_be_threads, opts.num_be_threads);
-    
+    "#,
+        opts.num_be_threads,
+        opts.num_be_threads,
+        opts.num_be_threads,
+        opts.num_be_threads,
+        opts.num_be_threads
+    );
+
     let mut be_child = Command::new("bash")
         .arg("-c")
         .arg(&be_script)
@@ -484,25 +506,31 @@ fn main() -> Result<()> {
 
     // Write parent process PIDs (tgid) to the ring buffer
     println!("\nWriting parent process PIDs (tgid) to ring buffer...");
-    
+
     match write_task_type_update(map_fd, lc_pid, TASK_TYPE_LC) {
         Ok(true) => println!("  Written: LC parent PID (tgid) {} -> LC", lc_pid),
-        Ok(false) => eprintln!("  Warning: Ring buffer full, could not write LC parent PID {} -> LC", lc_pid),
+        Ok(false) => eprintln!(
+            "  Warning: Ring buffer full, could not write LC parent PID {} -> LC",
+            lc_pid
+        ),
         Err(e) => eprintln!("  Error writing LC parent PID {} -> LC: {}", lc_pid, e),
     }
 
     match write_task_type_update(map_fd, be_pid, TASK_TYPE_BE) {
         Ok(true) => println!("  Written: BE parent PID (tgid) {} -> BE", be_pid),
-        Ok(false) => eprintln!("  Warning: Ring buffer full, could not write BE parent PID {} -> BE", be_pid),
+        Ok(false) => eprintln!(
+            "  Warning: Ring buffer full, could not write BE parent PID {} -> BE",
+            be_pid
+        ),
         Err(e) => eprintln!("  Error writing BE parent PID {} -> BE: {}", be_pid, e),
     }
 
     // Now we recursively write the sub processes of the parent processes into the ring buffer
     println!("\nRecursively writing child processes to ring buffer...");
-    
+
     // Wait a bit for processes to spawn
     thread::sleep(Duration::from_millis(500));
-    
+
     // Recursively write LC child processes (max depth 3 to avoid too many processes)
     let lc_children_written = recursively_write_children_to_ring_buffer(
         map_fd,
@@ -510,8 +538,9 @@ fn main() -> Result<()> {
         TASK_TYPE_LC,
         3, // max_depth
         0, // current_depth
-    ).unwrap_or(0);
-    
+    )
+    .unwrap_or(0);
+
     // Recursively write BE child processes (max depth 3)
     let be_children_written = recursively_write_children_to_ring_buffer(
         map_fd,
@@ -519,30 +548,40 @@ fn main() -> Result<()> {
         TASK_TYPE_BE,
         3, // max_depth
         0, // current_depth
-    ).unwrap_or(0);
-    
+    )
+    .unwrap_or(0);
+
     println!("  Written {} LC child processes", lc_children_written);
     println!("  Written {} BE child processes", be_children_written);
 
     println!("\nParent process PIDs written. Child processes are being tracked recursively.");
-    println!("LC parent (PID {}) spawns {} threads every 60s", lc_pid, opts.num_lc_threads);
-    println!("BE parent (PID {}) spawns {} threads every 60s", be_pid, opts.num_be_threads);
-    println!("Threads run for 50-60 seconds and are pinned to CPUs: {:?}", CORES);
+    println!(
+        "LC parent (PID {}) spawns {} threads every 60s",
+        lc_pid, opts.num_lc_threads
+    );
+    println!(
+        "BE parent (PID {}) spawns {} threads every 60s",
+        be_pid, opts.num_be_threads
+    );
+    println!(
+        "Threads run for 50-60 seconds and are pinned to CPUs: {:?}",
+        CORES
+    );
     println!("Press Ctrl+C to stop.");
 
     // Wait for Ctrl+C
     let shutdown = Arc::new(AtomicBool::new(false));
-    
+
     // // Set up a periodic task to update child processes (they spawn every 10s)
     // let map_fd_clone = map_fd;
     // let lc_pid_clone = lc_pid;
     // let be_pid_clone = be_pid;
     // let shutdown_clone = shutdown.clone();
-    
+
     // thread::spawn(move || {
     //     while !shutdown_clone.load(Ordering::Relaxed) {
     //         thread::sleep(Duration::from_secs(5)); // Check every 5 seconds
-            
+
     //         // Periodically update child processes
     //         let _ = recursively_write_children_to_ring_buffer(
     //             map_fd_clone,
@@ -569,7 +608,7 @@ fn main() -> Result<()> {
     // Keep running until interrupted
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
-        
+
         // Check if parent processes have died
         if let Ok(Some(_)) = lc_child.try_wait() {
             println!("LC parent process with PID {} has exited", lc_pid);
@@ -592,4 +631,3 @@ fn main() -> Result<()> {
     println!("Done.");
     Ok(())
 }
-

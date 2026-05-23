@@ -36,8 +36,8 @@ QPS_limit_specjbb = {
 
 # Control policy parameters (adjust as needed)
 CONTROL_INTERVAL_SEC = 1.0
-LC_P99_HIGH_MS = 1.5
-LC_P99_LOW_MS = 1.0
+LC_P99_HIGH_MS = 2.0
+LC_P99_LOW_MS = 1.5
 LC_MIN_CORES = 1
 
 DEFAULT_LATENCY_MAP_PATH = "/sys/fs/bpf/latency_map_path"
@@ -382,7 +382,7 @@ def run(
         lats_bin = TailbenchDir / "masstree" / "lats.bin"
         masstree_dir = TailbenchDir / "masstree"
         QPS = int(QPS_limit_masstree[num_cores] * pressure_num)
-        MAXREQS = QPS * 20
+        MAXREQS = QPS * 60
         WARMUPREQS = QPS
         MINSLEEPNS = 100
         NTHREADS = str(num_cores)
@@ -540,7 +540,7 @@ def run(
         # If LC latency is high, give one more core to LC.
         if measured_latency_ms > lc_p99_high_ms:
             if be_cores > 0:
-                lc_cores = min(lc_cores + 1, total_cores)
+                lc_cores = total_cores
                 apply_core_partition(
                     lc_root_pid=lc_process.pid,
                     be_root_pid=be_process.pid,
@@ -548,7 +548,7 @@ def run(
                     total_cores=total_cores,
                     available_cores=available_cores,
                 )
-                set_be_thread_count(total_cores - lc_cores)
+                set_be_thread_count(0)
             continue
 
         # Otherwise, keep the current partition.
